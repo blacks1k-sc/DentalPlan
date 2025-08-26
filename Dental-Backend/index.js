@@ -579,8 +579,34 @@ app.get('/get-chat-history', verifyToken, async (req, res) => {
     }
 });
 
-// Clear chat history for a patient (optional)
+// Clear chat history for a patient (POST method)
 app.post('/clear-chat-history', verifyToken, async (req, res) => {
+    try {
+        const { patientId } = req.body;
+
+        if (!patientId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Patient ID is required'
+            });
+        }
+        await ChatHistory.findOneAndDelete({ patientId });
+        res.json({
+            success: true,
+            message: 'Chat history cleared successfully'
+        });
+    } catch (error) {
+        console.error('Error clearing chat history:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error',
+            error: error.message
+        });
+    }
+});
+
+// Clear chat history for a patient (DELETE method - RESTful alternative)
+app.delete('/clear-chat-history', verifyToken, async (req, res) => {
     try {
         const { patientId } = req.body;
 
@@ -1182,7 +1208,7 @@ app.post('/start-chat-job', verifyToken, async (req, res) => {
             const filteredCurrentJson = filterJsonAnnotations(json);
             
             const flaskResponse = await axios.post(
-                `http://localhost:5001/api/rag-chat`,
+                `http://127.0.0.1:5001/api/rag-chat`,
                 { 
                     query, 
                     json: filteredCurrentJson, 

@@ -276,15 +276,29 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
     if (!patientId) return;
 
     try {
-      await axios.delete(`${apiUrl}/clear-chat-history`, {
-        data: { patientId },
+      // Show loading state
+      setIsLoading(true);
+      
+      await axios.post(`${apiUrl}/clear-chat-history`, {
+        patientId
+      }, {
         headers: {
           Authorization: sessionManager.getItem("token")
         }
       });
+      
+      // Clear messages and show success feedback
       setMessages([]);
+      
+      // Optional: Show a brief success message
+      // You can add a toast notification here if you have one
+      console.log('Chat history cleared successfully');
+      
     } catch (error) {
       console.error('Error clearing chat history:', error);
+      // Optional: Show error message to user
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -470,12 +484,14 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
                 onClick={clearChatHistory}
                 className="border-0 px-2 py-1 text-xs"
                 title="Clear chat history"
+                disabled={isLoading}
                 style={{
                   whiteSpace: 'nowrap',
                   flexShrink: 0,
+                  opacity: isLoading ? 0.6 : 1,
                 }}
               >
-                Clear
+                {isLoading ? 'Clearing...' : 'Clear'}
               </Button>
             )}
             <Button
