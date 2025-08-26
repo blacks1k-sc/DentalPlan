@@ -199,7 +199,9 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
 
   const startRagJob = async (query) => {
     const response = await axios.post(`${apiUrl}/start-chat-job`, {
-      query: query, patient_name: sessionStorage.getItem("patientId")
+      query: query, 
+      json: [], // Empty array for now since this is just chat, not annotation-based
+      patient_id: sessionStorage.getItem("patientId")
     }, {
       headers: {
         Authorization: sessionManager.getItem("token")

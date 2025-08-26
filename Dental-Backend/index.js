@@ -1207,14 +1207,17 @@ app.post('/start-chat-job', verifyToken, async (req, res) => {
             // Filter the current JSON as well
             const filteredCurrentJson = filterJsonAnnotations(json);
             
+            const requestPayload = { 
+                query, 
+                json: filteredCurrentJson, 
+                patient_name: patient_id,
+                patient_history: patientHistory
+            };
+            console.log('Sending to Flask:', JSON.stringify(requestPayload, null, 2));
+            
             const flaskResponse = await axios.post(
                 `http://127.0.0.1:5001/api/rag-chat`,
-                { 
-                    query, 
-                    json: filteredCurrentJson, 
-                    patient_id,
-                    patient_history: patientHistory
-                },
+                requestPayload,
                 {
                     timeout: 600000,
                     headers: {
@@ -1226,6 +1229,9 @@ app.post('/start-chat-job', verifyToken, async (req, res) => {
             jobResults.set(jobId, { status: 'completed', result: flaskResponse.data, error: null });
         } catch (error) {
             console.error('Async job error:', error.message);
+            console.error('Full error object:', error);
+            console.error('Error response data:', error.response?.data);
+            console.error('Error response status:', error.response?.status);
             jobResults.set(jobId, {
                 status: 'failed',
                 result: null,

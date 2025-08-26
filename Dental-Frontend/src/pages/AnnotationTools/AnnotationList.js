@@ -381,6 +381,7 @@ const AnnotationList = ({
   // }
 
   const structureAnnotationsForRAG = (selectedAnomalyMap = {}) => {
+    console.log("structureAnnotationsForRAG called with:", { selectedAnomalyMap, annotationsCount: annotations.length })
     const teethData = {}
 
     // Process all annotations to group by tooth
@@ -480,9 +481,11 @@ const AnnotationList = ({
       })
       .filter((tooth) => tooth.anomalies || tooth.procedures || tooth.foreign_objects) // Only include teeth with data
 
-    return {
-      teeth: { teeth: teethArray} ,
+    const result = {
+      teeth: teethArray
     }
+    console.log("structureAnnotationsForRAG returning:", result)
+    return result
   }
 
   // Helper function to compare segmentation arrays for exact match
@@ -495,12 +498,14 @@ const AnnotationList = ({
     })
   }
   const startRagJob = async (structuredData, query = "create a treatment plan") => {
+    console.log("Starting RAG job with data:", { query, structuredData, patient_name: sessionStorage.getItem("patientId") })
+    
     const response = await axios.post(
       `${apiUrl}/start-chat-job`,
       {
         query: query,
-        json: structuredData.teeth,
-        patient_name: sessionStorage.getItem("patientId")
+        json: structuredData,
+        patient_id: sessionStorage.getItem("patientId")
       },
       {
         headers: {
@@ -508,22 +513,42 @@ const AnnotationList = ({
         },
       },
     )
+    
+    console.log("RAG job response:", response.data)
     return response.data.jobId
   }
 
   const pollRagJob = async (jobId, maxRetries = 120, interval = 10000) => {
     for (let i = 0; i < maxRetries; i++) {
-      const response = await axios.get(`${apiUrl}/chat-job-status/${jobId}`, {
-        headers: {
-          Authorization: sessionManager.getItem("token"),
-        },
-      })
+      try {
+        const response = await axios.get(`${apiUrl}/chat-job-status/${jobId}`, {
+          headers: {
+            Authorization: sessionManager.getItem("token"),
+          },
+        })
 
-      const { status, result, error } = response.data
-      if (status === "completed") return result
-      if (status === "failed") throw new Error(error)
+        // Check for non-200 responses and log them
+        if (response.status !== 200) {
+          console.error("pollRagJob non-200:", response.status, response.data);
+        }
 
-      await new Promise((resolve) => setTimeout(resolve, interval))
+        const { status, result, error } = response.data
+        console.log("pollRagJob response:", { status, result, error, jobId, attempt: i + 1 })
+        
+        if (status === "completed") {
+          console.log("Job completed successfully:", result)
+          return result
+        }
+        if (status === "failed") {
+          console.error("Job failed:", error)
+          throw new Error(error)
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, interval))
+      } catch (error) {
+        console.error("Error in pollRagJob attempt", i + 1, ":", error)
+        if (i === maxRetries - 1) throw error
+      }
     }
 
     throw new Error("Job timeout")
@@ -551,7 +576,7 @@ const AnnotationList = ({
 
       // const response = await axios.post(`${apiUrl}/chat-with-rag`, {
       //     query: `create a treatment plan`,
-      //     json: structuredData.teeth, // Send the structured teeth data
+      //     json: structuredData, // Send the structured data
       //   },
       //   {
       //   timeout: 600000,
@@ -561,11 +586,24 @@ const AnnotationList = ({
       //   },
       // })
       const jobId = await startRagJob(structuredData)
+      console.log("Job started with ID:", jobId)
+      
       const ragText = await pollRagJob(jobId)
-      console.log(ragText)
+      console.log("RAG response received:", ragText)
+      
+      if (!ragText || !ragText.answer) {
+        console.error("Invalid RAG response:", ragText)
+        throw new Error("Invalid RAG response - missing answer")
+      }
+      
       return parseCdtCodes(ragText.answer, convertedCdtCode, selectedAnomaly)
     } catch (error) {
-      console.error("Error fetching CDT codes:", error)
+      console.error("Error fetching CDT codes:", {
+        status: error?.response?.status,
+        data: error?.response?.data,
+        message: error?.message,
+        error: error
+      })
       setTreatmentPlanError(true)
       return []
     }
@@ -929,7 +967,7 @@ const AnnotationList = ({
 
       // const response = await axios.post(`${apiUrl}/chat-with-rag`, {
       //     query: `create a treatment plan`,
-      //     json: structuredData.teeth, // Send the structured teeth data
+      //     json: structuredData, // Send the structured data
       //   },
       //   {
       //   timeout: 600000,
@@ -939,10 +977,17 @@ const AnnotationList = ({
       //   },
       // })
       const jobId = await startRagJob(structuredData, "")
+      console.log("Initial context job started with ID:", jobId)
+      
       const ragText = await pollRagJob(jobId)
-      console.log(ragText)
+      console.log("Initial context RAG response:", ragText)
     } catch (error) {
-      console.error("Error fetching CDT codes:", error)
+      console.error("Error fetching CDT codes:", {
+        status: error?.response?.status,
+        data: error?.response?.data,
+        message: error?.message,
+        error: error
+      })
       return []
     }
   }
