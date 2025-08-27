@@ -2,8 +2,27 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Button, Form, Input, Popover, PopoverBody } from 'reactstrap';
 import sessionManager from "utils/sessionManager"
 import axios from 'axios';
+import { parsePipeDelimitedTable } from '../../utils/tableParser';
+import ttsInstance from '../../utils/textToSpeech';
+// Removed speechToText utility import - implementing real-time transcription directly
 
 const DentalChatPopup = ({ isOpen, toggle, target }) => {
+  // Add CSS animation for pulse effect
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.textContent = `
+      @keyframes pulse {
+        0% { transform: scale(1); opacity: 0.8; }
+        50% { transform: scale(1.2); opacity: 0.4; }
+        100% { transform: scale(1); opacity: 0.8; }
+      }
+    `;
+    document.head.appendChild(style);
+    
+    return () => {
+      document.head.removeChild(style);
+    };
+  }, []);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -20,6 +39,19 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
     const saved = localStorage.getItem('chatPopupSize');
     return saved ? JSON.parse(saved) : { width: 600, height: 500 };
   });
+  
+  // Speech-to-text states
+  const [isRecording, setIsRecording] = useState(false);
+  const [transcribedText, setTranscribedText] = useState('');
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [audioChunks, setAudioChunks] = useState([]);
+  const [audioContext, setAudioContext] = useState(null);
+  
+  // Text-to-Speech states
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [currentSpeakingText, setCurrentSpeakingText] = useState('');
+  
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const chatWindowRef = useRef(null);
@@ -31,10 +63,223 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
   // Check if timestamps should be shown
   const showTimestamps = clientId === "67161fcbadd1249d59085f9a";
 
+  // Speech-to-text functions with real-time transcription
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Set up audio context for recording
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = audioCtx.createAnalyser();
+      const microphone = audioCtx.createMediaStreamSource(stream);
+      
+      microphone.connect(analyser);
+      
+      // Set up MediaRecorder for backup (not used for real-time)
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      const chunks = [];
+      
+      recorder.ondataavailable = (event) => {
+        chunks.push(event.data);
+      };
+      
+      // Start real-time speech recognition
+      if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+        
+        recognition.continuous = true; // Enable continuous recognition
+        recognition.interimResults = true; // Get interim results as user speaks
+        recognition.lang = 'en-US';
+        
+        recognition.onresult = (event) => {
+          let finalTranscript = '';
+          let interimTranscript = '';
+          
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalTranscript += transcript;
+            } else {
+              interimTranscript += transcript;
+            }
+          }
+          
+          // Update the input field in real-time
+          if (finalTranscript) {
+            setTranscribedText(finalTranscript);
+            setInput(finalTranscript);
+          } else if (interimTranscript) {
+            // Show interim results as user speaks
+            setTranscribedText(interimTranscript);
+            setInput(interimTranscript);
+          }
+        };
+        
+        recognition.onerror = (event) => {
+          console.error('Speech recognition error:', event.error);
+        };
+        
+        recognition.onend = () => {
+          console.log('Speech recognition ended');
+        };
+        
+        // Start recognition
+        recognition.start();
+        
+        // Store recognition instance for cleanup
+        setMediaRecorder({ recognition, recorder });
+      }
+      
+      // Start recording
+      recorder.start();
+      
+      setAudioChunks(chunks);
+      setAudioContext(audioCtx);
+      setIsRecording(true);
+      setTranscribedText('');
+      
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      alert('Error accessing microphone. Please check permissions.');
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorder && isRecording) {
+      // Stop both recognition and recording
+      if (mediaRecorder.recognition) {
+        mediaRecorder.recognition.stop();
+      }
+      if (mediaRecorder.recorder) {
+        mediaRecorder.recorder.stop();
+      }
+      
+      setIsRecording(false);
+      
+      // Clean up audio context safely
+      if (audioContext && audioContext.state !== 'closed') {
+        try {
+          audioContext.close();
+        } catch (error) {
+          console.log('AudioContext already closed or closing');
+        }
+        setAudioContext(null);
+      }
+    }
+  };
+
+  // Real-time transcription is now handled directly in startRecording
+
+  // Text-to-Speech functions
+  const initializeTTS = async () => {
+    try {
+      const success = await ttsInstance.initialize();
+      if (success) {
+        console.log('TTS initialized successfully');
+      } else {
+        console.log('TTS initialization failed, using fallback');
+      }
+    } catch (error) {
+      console.error('Error initializing TTS:', error);
+    }
+  };
+
+  const speakText = (text) => {
+    if (!ttsInstance.isSupported()) {
+      alert('Text-to-speech not supported in this browser');
+      return;
+    }
+
+    try {
+      // Stop any current speech before starting new one
+      if (isSpeaking) {
+        ttsInstance.stop();
+        setIsSpeaking(false);
+        setIsPaused(false);
+      }
+      
+      ttsInstance.speak(text);
+      setIsSpeaking(true);
+      setIsPaused(false);
+      setCurrentSpeakingText(text);
+      
+      // Update status periodically
+      const statusInterval = setInterval(() => {
+        const status = ttsInstance.getStatus();
+        setIsSpeaking(status.isPlaying);
+        setIsPaused(status.isPaused);
+        
+        if (!status.isPlaying && !status.isPaused) {
+          clearInterval(statusInterval);
+          setCurrentSpeakingText('');
+        }
+      }, 100);
+      
+    } catch (error) {
+      console.error('Error speaking text:', error);
+      alert('Error starting text-to-speech');
+    }
+  };
+
+
+
+  const pauseSpeech = () => {
+    ttsInstance.pause();
+    setIsPaused(true);
+  };
+
+  const resumeSpeech = () => {
+    ttsInstance.resume();
+    setIsPaused(false);
+  };
+
+  const stopSpeech = () => {
+    ttsInstance.stop();
+    setIsSpeaking(false);
+    setIsPaused(false);
+    setCurrentSpeakingText('');
+  };
+
+  // Initialize TTS when component mounts
+  useEffect(() => {
+    initializeTTS();
+  }, []);
+
   // Save position and size to localStorage
   useEffect(() => {
     localStorage.setItem('chatPopupPosition', JSON.stringify(position));
   }, [position]);
+
+  // Cleanup audio resources when component unmounts
+  useEffect(() => {
+    return () => {
+      if (mediaRecorder && isRecording) {
+        try {
+          if (mediaRecorder.recognition) {
+            mediaRecorder.recognition.stop();
+          }
+          if (mediaRecorder.recorder) {
+            mediaRecorder.recorder.stop();
+          }
+        } catch (error) {
+          console.log('MediaRecorder already stopped');
+        }
+      }
+      if (audioContext && audioContext.state !== 'closed') {
+        try {
+          audioContext.close();
+        } catch (error) {
+          console.log('AudioContext already closed or closing');
+        }
+      }
+      
+      // Cleanup TTS
+      if (ttsInstance) {
+        ttsInstance.stop();
+      }
+    };
+  }, [mediaRecorder, isRecording, audioContext]);
 
   useEffect(() => {
     localStorage.setItem('chatPopupSize', JSON.stringify(size));
@@ -257,6 +502,8 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
 
       // Save bot message to database
       await saveChatMessage(botMessage);
+      
+      // Auto-speak AI response (removed - now using individual speaker buttons)
     } catch (error) {
       console.error('Error:', error);
       const errorMessage = {
@@ -564,16 +811,110 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
                     }}
                   >
                     <div>
-                      {msg.sender !== 'bot' ? `${msg.sender}: ${msg.text}` : `Oral Wisdom AI: ${msg.text}`}
+                      {msg.sender !== 'bot' ? (
+                        `${msg.sender}: ${msg.text}`
+                      ) : (
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                            <span>Oral Wisdom AI:</span>
+                          </div>
+                          
+                          <div dangerouslySetInnerHTML={{ __html: parsePipeDelimitedTable(msg.text) }} />
+                        </div>
+                      )}
                     </div>
                     {showTimestamps && msg.timestamp && (
                       <div style={{
-                        fontSize: '10px',
-                        opacity: 0.6,
-                        marginTop: '4px',
-                        fontStyle: 'italic'
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginTop: '8px',
+                        padding: '0 4px'
                       }}>
-                        {formatTimestamp(msg.timestamp)}
+                        {/* Timestamp */}
+                        <div style={{
+                          fontSize: '10px',
+                          opacity: 0.6,
+                          fontStyle: 'italic'
+                        }}>
+                          {formatTimestamp(msg.timestamp)}
+                        </div>
+                        
+                        {/* TTS Controls - Simple ChatGPT-style icons */}
+                        {msg.sender === 'bot' && (
+                          <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px'
+                          }}>
+                            {/* Speaker Button */}
+                            <Button
+                              type="button"
+                              onClick={() => {
+                                if (isSpeaking && currentSpeakingText === msg.text) {
+                                  stopSpeech();
+                                } else {
+                                  speakText(msg.text);
+                                }
+                              }}
+                              disabled={isLoading || isLoadingHistory}
+                              style={{
+                                backgroundColor: 'transparent',
+                                border: 'none',
+                                padding: '4px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                cursor: (isLoading || isLoadingHistory) ? 'not-allowed' : 'pointer',
+                                borderRadius: '4px',
+                                minWidth: '24px',
+                                height: '24px'
+                              }}
+                              title={(isSpeaking && currentSpeakingText === msg.text) ? 'Stop Speaking' : 'Speak this response'}
+                              onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
+                              onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+                            >
+                              <i 
+                                className={(isSpeaking && currentSpeakingText === msg.text) ? 'ion ion-md-close' : 'ion ion-md-volume-high'} 
+                                style={{ 
+                                  color: (isSpeaking && currentSpeakingText === msg.text) ? '#dc3545' : '#6c757d', 
+                                  fontSize: '16px' 
+                                }} 
+                              />
+                            </Button>
+
+                            {/* Pause/Resume Button - only show when speaking this message */}
+                            {isSpeaking && currentSpeakingText === msg.text && (
+                              <Button
+                                type="button"
+                                onClick={isPaused ? resumeSpeech : pauseSpeech}
+                                style={{
+                                  backgroundColor: 'transparent',
+                                  border: 'none',
+                                  padding: '4px',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  cursor: 'pointer',
+                                  borderRadius: '4px',
+                                  minWidth: '24px',
+                                  height: '24px'
+                                }}
+                                title={isPaused ? 'Resume Speaking' : 'Pause Speaking'}
+                                onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
+                                onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+                              >
+                                <i 
+                                  className={isPaused ? 'ion ion-md-play' : 'ion ion-md-pause'} 
+                                  style={{ 
+                                    color: isPaused ? '#28a745' : '#6c757d', 
+                                    fontSize: '16px' 
+                                  }} 
+                                />
+                              </Button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -604,7 +945,7 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
             flexShrink: 0
           }}
         >
-          <div style={{ display: 'flex', width: '100%', gap: '8px' }}>
+          <div style={{ display: 'flex', width: '100%', gap: '8px', alignItems: 'center' }}>
             <Input
               type="text"
               value={input}
@@ -623,6 +964,124 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
               onFocus={(e) => e.target.style.borderColor = '#007bff'}
               onBlur={(e) => e.target.style.borderColor = '#ccc'}
             />
+            
+            {/* Microphone Button */}
+            <Button
+              type="button"
+              onClick={isRecording ? stopRecording : startRecording}
+              disabled={isLoading || isLoadingHistory}
+              style={{
+                backgroundColor: isRecording ? '#dc3545' : '#6c757d',
+                border: 'none',
+                borderRadius: '50%',
+                width: '40px',
+                height: '40px',
+                padding: '0',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: (isLoading || isLoadingHistory) ? 'not-allowed' : 'pointer',
+                flexShrink: 0,
+                position: 'relative'
+              }}
+              title={isRecording ? 'Stop Recording' : 'Start Voice Input'}
+            >
+              {isRecording ? (
+                <i className="ion ion-md-square" style={{ color: 'white', fontSize: '16px' }}></i>
+              ) : (
+                <i className="ion ion-md-mic" style={{ color: 'white', fontSize: '16px' }}></i>
+              )}
+              
+              {/* Voice Level Indicator */}
+              {isRecording && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '-8px',
+                    right: '-8px',
+                    width: '16px',
+                    height: '16px',
+                    borderRadius: '50%',
+                    backgroundColor: '#dc3545',
+                    animation: 'pulse 1s infinite',
+                    opacity: 0.8
+                  }}
+                />
+              )}
+            </Button>
+
+            {/* Main Speaker Button for Input Field */}
+            <Button
+              type="button"
+              onClick={() => {
+                if (isSpeaking && currentSpeakingText === input) {
+                  stopSpeech();
+                } else {
+                  speakText(input);
+                }
+              }}
+              disabled={isLoading || isLoadingHistory || !input.trim()}
+              style={{
+                backgroundColor: 'transparent',
+                border: 'none',
+                borderRadius: '4px',
+                width: '40px',
+                height: '40px',
+                padding: '0',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: (isLoading || isLoadingHistory || !input.trim()) ? 'not-allowed' : 'pointer',
+                flexShrink: 0,
+                position: 'relative'
+              }}
+              title={(isSpeaking && currentSpeakingText === input) ? 'Stop Speaking' : 'Speak Input Text'}
+              onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
+              onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+            >
+              <i 
+                className={(isSpeaking && currentSpeakingText === input) ? 'ion ion-md-close' : 'ion ion-md-volume-high'} 
+                style={{ 
+                  color: (isSpeaking && currentSpeakingText === input) ? '#dc3545' : '#6c757d', 
+                  fontSize: '18px' 
+                }} 
+              />
+            </Button>
+
+            {/* Main Pause/Resume Button (only show when speaking input text) */}
+            {isSpeaking && currentSpeakingText === input && (
+              <Button
+                type="button"
+                onClick={isPaused ? resumeSpeech : pauseSpeech}
+                style={{
+                  backgroundColor: 'transparent',
+                  border: 'none',
+                  borderRadius: '4px',
+                  width: '40px',
+                  height: '40px',
+                  padding: '0',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  flexShrink: 0
+                }}
+                title={isPaused ? 'Resume Speaking' : 'Pause Speaking'}
+                onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
+                onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+              >
+                <i 
+                  className={isPaused ? 'ion ion-md-play' : 'ion ion-md-pause'} 
+                  style={{ 
+                    color: isPaused ? '#28a745' : '#6c757d', 
+                    fontSize: '18px' 
+                  }} 
+                />
+              </Button>
+            )}
+
+
+            
             <Button
               type="submit"
               disabled={isLoading || isLoadingHistory}
@@ -641,6 +1100,10 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
               Send
             </Button>
           </div>
+          
+
+          
+          {/* Clean interface - no voice level or transcribed text display */}
         </Form>
       </div>
     </div>

@@ -28,6 +28,7 @@ import { calculateOverlap, polygonArea } from "./path-utils"
 import DentalChart from "./DentalChart"
 import sessionManager from "utils/sessionManager"
 import AnnotationPrerequisitesModal from "./AnnotationPrerequisitesModal"
+import { parsePipeDelimitedTable } from '../../utils/tableParser';
 const AnnotationList = ({
   annotations,
   hiddenAnnotations,
