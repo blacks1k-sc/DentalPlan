@@ -84,9 +84,15 @@ connectToDatabase();
 
 
 const verifyToken = (req, res, next) => {
-    const token = req.headers['authorization'];
-    if (!token) {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) {
         return res.status(403).json({ message: 'No token provided.' });
+    }
+
+    // Extract token from "Bearer <token>" format
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    if (!token) {
+        return res.status(403).json({ message: 'Invalid token format.' });
     }
 
     jwt.verify(token, jwtSecretKey, (err, decoded) => {
@@ -449,6 +455,10 @@ const ChatHistorySchema = new mongoose.Schema({
         type: String,
         required: true,
     },
+    visitId: {
+        type: String,
+        required: true,
+    },
     messages: [{
         text: {
             type: String,
@@ -490,17 +500,35 @@ const ChatHistory = mongoose.model('ChatHistory', ChatHistorySchema);
 // Save chat message
 app.post('/save-chat-message', verifyToken, async (req, res) => {
     try {
-        const { patientId, message } = req.body;
+        const { patientId, visitId, message } = req.body;
 
         if (!patientId || !message) {
             return res.status(400).json({
                 success: false,
-                message: 'Missing required fields'
+                message: 'Missing required fields: patientId and message are required'
             });
         }
 
-        // Find existing chat history or create new one
-        let chatHistory = await ChatHistory.findOne({ patientId });
+        let chatHistory;
+        
+        if (visitId) {
+            // Try to find chat history for specific visit first
+            chatHistory = await ChatHistory.findOne({ patientId, visitId });
+            
+            // If no visit-specific history found, try to find patient-only history (for backward compatibility)
+            if (!chatHistory) {
+                chatHistory = await ChatHistory.findOne({ patientId, visitId: { $exists: false } });
+                
+                // If we found old-style history, migrate it to include visitId
+                if (chatHistory) {
+                    console.log(`Migrating old chat history for patient ${patientId} to include visitId ${visitId}`);
+                    chatHistory.visitId = visitId;
+                }
+            }
+        } else {
+            // Fallback to patient-only history (for backward compatibility)
+            chatHistory = await ChatHistory.findOne({ patientId, visitId: { $exists: false } });
+        }
 
         if (chatHistory) {
             // Add message to existing history
@@ -515,6 +543,7 @@ app.post('/save-chat-message', verifyToken, async (req, res) => {
             // Create new chat history
             chatHistory = new ChatHistory({
                 patientId,
+                visitId: visitId || 'legacy', // Use 'legacy' if no visitId provided
                 messages: [{
                     text: message.text,
                     sender: message.sender,
@@ -543,10 +572,10 @@ app.post('/save-chat-message', verifyToken, async (req, res) => {
     }
 });
 
-// Get chat history for a patient
+// Get chat history for a specific patient visit
 app.get('/get-chat-history', verifyToken, async (req, res) => {
     try {
-        const patientId = req.query.patientId;
+        const { patientId, visitId } = req.query;
 
         if (!patientId) {
             return res.status(400).json({
@@ -555,7 +584,27 @@ app.get('/get-chat-history', verifyToken, async (req, res) => {
             });
         }
 
-        const chatHistory = await ChatHistory.findOne({ patientId });
+        let chatHistory;
+        
+        if (visitId) {
+            // Try to find chat history for specific visit first
+            chatHistory = await ChatHistory.findOne({ patientId, visitId });
+            
+            // If no visit-specific history found, try to find patient-only history (for backward compatibility)
+            if (!chatHistory) {
+                chatHistory = await ChatHistory.findOne({ patientId, visitId: { $exists: false } });
+                
+                // If we found old-style history, migrate it to include visitId
+                if (chatHistory) {
+                    console.log(`Migrating old chat history for patient ${patientId} to include visitId ${visitId}`);
+                    chatHistory.visitId = visitId;
+                    await chatHistory.save();
+                }
+            }
+        } else {
+            // Fallback to patient-only history (for backward compatibility)
+            chatHistory = await ChatHistory.findOne({ patientId, visitId: { $exists: false } });
+        }
 
         if (!chatHistory) {
             return res.json({
@@ -579,10 +628,10 @@ app.get('/get-chat-history', verifyToken, async (req, res) => {
     }
 });
 
-// Clear chat history for a patient (POST method)
+// Clear chat history for a specific patient visit (POST method)
 app.post('/clear-chat-history', verifyToken, async (req, res) => {
     try {
-        const { patientId } = req.body;
+        const { patientId, visitId } = req.body;
 
         if (!patientId) {
             return res.status(400).json({
@@ -590,10 +639,23 @@ app.post('/clear-chat-history', verifyToken, async (req, res) => {
                 message: 'Patient ID is required'
             });
         }
-        await ChatHistory.findOneAndDelete({ patientId });
+
+        let deleteResult;
+        if (visitId) {
+            // Clear specific visit history
+            deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId });
+            if (!deleteResult) {
+                // Try to clear old-style history for backward compatibility
+                deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId: { $exists: false } });
+            }
+        } else {
+            // Clear all patient history (for backward compatibility)
+            deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId: { $exists: false } });
+        }
+
         res.json({
             success: true,
-            message: 'Chat history cleared successfully'
+            message: visitId ? 'Chat history cleared successfully for this visit' : 'Chat history cleared successfully for this patient'
         });
     } catch (error) {
         console.error('Error clearing chat history:', error);
@@ -605,10 +667,10 @@ app.post('/clear-chat-history', verifyToken, async (req, res) => {
     }
 });
 
-// Clear chat history for a patient (DELETE method - RESTful alternative)
+// Clear chat history for a specific patient visit (DELETE method - RESTful alternative)
 app.delete('/clear-chat-history', verifyToken, async (req, res) => {
     try {
-        const { patientId } = req.body;
+        const { patientId, visitId } = req.body;
 
         if (!patientId) {
             return res.status(400).json({
@@ -616,10 +678,23 @@ app.delete('/clear-chat-history', verifyToken, async (req, res) => {
                 message: 'Patient ID is required'
             });
         }
-        await ChatHistory.findOneAndDelete({ patientId });
+
+        let deleteResult;
+        if (visitId) {
+            // Clear specific visit history
+            deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId });
+            if (!deleteResult) {
+                // Try to clear old-style history for backward compatibility
+                deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId: { $exists: false } });
+            }
+        } else {
+            // Clear all patient history (for backward compatibility)
+            deleteResult = await ChatHistory.findOneAndDelete({ patientId, visitId: { $exists: false } });
+        }
+
         res.json({
             success: true,
-            message: 'Chat history cleared successfully'
+            message: visitId ? 'Chat history cleared successfully for this visit' : 'Chat history cleared successfully for this patient'
         });
     } catch (error) {
         console.error('Error clearing chat history:', error);
@@ -1801,6 +1876,67 @@ app.use('/AnnotatedFiles/Thumbnail', express.static(path.join(__dirname, 'Annota
 app.use('/AnnotatedFiles', express.static(path.join(__dirname, 'AnnotatedFiles')));
 // Serve static files from the 'public/images' directory
 //app.use('/images', express.static(path.join(__dirname, 'AnnotatedFiles/Thumbnail')));
+
+// Streaming RAG chat endpoint
+app.post('/api/rag-chat-stream', verifyToken, async (req, res) => {
+    try {
+        const { query, json, patient_name, chat_history = [] } = req.body;
+
+        if (!query || !json || !patient_name) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required fields: query, json, and patient_name are required'
+            });
+        }
+
+        // Set headers for Server-Sent Events
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Cache-Control'
+        });
+
+        // Forward the request to Flask RAG service
+        const flaskResponse = await axios.post('http://127.0.0.1:5001/api/rag-chat-stream', {
+            query,
+            json,
+            patient_name,
+            chat_history
+        }, {
+            responseType: 'stream',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        // Stream the response from Flask to the frontend
+        flaskResponse.data.on('data', (chunk) => {
+            const chunkStr = chunk.toString();
+            if (chunkStr.trim()) {
+                res.write(chunkStr);
+            }
+        });
+
+        flaskResponse.data.on('end', () => {
+            res.end();
+        });
+
+        flaskResponse.data.on('error', (error) => {
+            console.error('Error streaming from Flask:', error);
+            res.write(`data: ${JSON.stringify({type: 'error', content: 'Streaming error', done: true})}\n\n`);
+            res.end();
+        });
+
+    } catch (error) {
+        console.error('Error in streaming RAG chat:', error);
+        
+        // Send error as SSE
+        res.write(`data: ${JSON.stringify({type: 'error', content: error.message, done: true})}\n\n`);
+        res.end();
+    }
+});
 
 const server = app.listen(3000, () => console.log('Server running on port 3000'));
 server.setTimeout(600000)

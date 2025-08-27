@@ -58,6 +58,7 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
   const dragHandleRef = useRef(null);
   const apiUrl = process.env.REACT_APP_NODEAPIURL;
   const patientId = sessionManager.getItem('patientId');
+  const visitId = sessionManager.getItem('visitId');
   const clientId = sessionManager.getItem('clientId');
 
   // Check if timestamps should be shown
@@ -298,12 +299,13 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
     }
   }, [messages, isOpen]);
 
-  // Load chat history when popup opens and patientId is available
+  // Load chat history when popup opens and both patientId and visitId are available
   useEffect(() => {
-    if (isOpen && patientId) {
+    console.log('ChatPopup useEffect triggered:', { isOpen, patientId, visitId });
+    if (isOpen && patientId && visitId) {
       loadChatHistory();
     }
-  }, [isOpen, patientId]);
+  }, [isOpen, patientId, visitId]);
 
   // Drag and resize functionality
   useEffect(() => {
@@ -396,18 +398,23 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
   };
 
   const loadChatHistory = async () => {
-    if (!patientId) return;
+    if (!patientId || !visitId) {
+      console.log('Cannot load chat history: patientId =', patientId, 'visitId =', visitId);
+      return;
+    }
 
+    console.log('Loading chat history for patient:', patientId, 'visit:', visitId);
     setIsLoadingHistory(true);
     try {
       const response = await axios.get(`${apiUrl}/get-chat-history`, {
-        params: { patientId },
+        params: { patientId, visitId },
         headers: {
           Authorization: sessionManager.getItem("token")
         }
       });
 
       if (response.data.success) {
+        console.log('Chat history loaded successfully:', response.data.messages.length, 'messages');
         // Convert timestamp to match existing message format
         const formattedMessages = response.data.messages.map(msg => ({
           text: msg.text,
@@ -419,17 +426,24 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
       }
     } catch (error) {
       console.error('Error loading chat history:', error);
+      console.error('Response data:', error.response?.data);
+      console.error('Response status:', error.response?.status);
     } finally {
       setIsLoadingHistory(false);
     }
   };
 
   const saveChatMessage = async (message) => {
-    if (!patientId) return;
+    if (!patientId || !visitId) {
+      console.log('Cannot save chat message: patientId =', patientId, 'visitId =', visitId);
+      return;
+    }
 
+    console.log('Saving chat message for patient:', patientId, 'visit:', visitId);
     try {
       await axios.post(`${apiUrl}/save-chat-message`, {
         patientId,
+        visitId,
         message,
         sender: `${sessionManager.getItem('firstName')} ${sessionManager.getItem('lastName')}`
       }, {
@@ -437,6 +451,7 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
           Authorization: sessionManager.getItem("token")
         }
       });
+      console.log('Chat message saved successfully');
     } catch (error) {
       console.error('Error saving chat message:', error);
     }
@@ -473,63 +488,145 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
     throw new Error("Job timeout");
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!input.trim()) return;
+  const handleSendMessage = async () => {
+    if (!input.trim() || isLoading) return;
 
-    // Add user message
-    const userMessage = { text: input, sender: `${sessionManager.getItem('firstName')} ${sessionManager.getItem('lastName')}`, timestamp: new Date() };
+    const userMessage = {
+      text: input,
+      sender: 'user',
+      timestamp: new Date(),
+      isError: false
+    };
+
+    // Add user message to chat
     setMessages(prev => [...prev, userMessage]);
-
-    // Save user message to database
-    await saveChatMessage(userMessage);
-
     setInput('');
     setIsLoading(true);
 
+    // Add a placeholder bot message that will be updated in real-time
+    const botMessageId = Date.now();
+    const botMessage = {
+      id: botMessageId,
+      text: '',
+      sender: 'bot',
+      timestamp: new Date(),
+      isError: false,
+      isStreaming: true
+    };
+
+    setMessages(prev => [...prev, botMessage]);
+
     try {
-      // Call backend API with the custom prompt template
-      const jobId = await startRagJob(input);
-      const ragText = await pollRagJob(jobId);
+      // Use streaming endpoint instead of polling
+              const response = await fetch(`http://localhost:3000/api/rag-chat-stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionManager.getItem("token")}`
+        },
+        body: JSON.stringify({
+          query: input,
+          json: [],
+          patient_name: patientId,
+          chat_history: messages.map(msg => ({
+            text: msg.text,
+            sender: msg.sender
+          }))
+        })
+      });
 
-      // Add bot message
-      const botMessage = {
-        text: ragText.answer,
-        sender: 'bot',
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, botMessage]);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
 
-      // Save bot message to database
-      await saveChatMessage(botMessage);
-      
-      // Auto-speak AI response (removed - now using individual speaker buttons)
+      // Create a reader for the streaming response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      // Read the stream in real-time
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        // Decode the chunk and process it
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'token') {
+                // Add new token to the accumulated text
+                accumulatedText += data.content;
+                
+                // Update the bot message in real-time
+                setMessages(prev => prev.map(msg => 
+                  msg.id === botMessageId 
+                    ? { ...msg, text: accumulatedText }
+                    : msg
+                ));
+              } else if (data.type === 'done') {
+                // Streaming is complete
+                setMessages(prev => prev.map(msg => 
+                  msg.id === botMessageId 
+                    ? { ...msg, isStreaming: false }
+                    : msg
+                ));
+                
+                // Save the complete message
+                if (accumulatedText.trim()) {
+                  saveChatMessage({
+                    text: accumulatedText,
+                    sender: 'bot',
+                    timestamp: new Date(),
+                    isError: false
+                  });
+                }
+                break;
+              } else if (data.type === 'error') {
+                // Handle error
+                setMessages(prev => prev.map(msg => 
+                  msg.id === botMessageId 
+                    ? { ...msg, text: `Error: ${data.content}`, isError: true, isStreaming: false }
+                    : msg
+                ));
+                break;
+              }
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError);
+            }
+          }
+        }
+      }
+
     } catch (error) {
-      console.error('Error:', error);
-      const errorMessage = {
-        text: 'Sorry, I encountered an error. Please try again.',
-        sender: 'bot',
-        isError: true,
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, errorMessage]);
-
-      // Save error message to database
-      await saveChatMessage(errorMessage);
+      console.error('Error in streaming chat:', error);
+      
+      // Update the bot message with error
+      setMessages(prev => prev.map(msg => 
+        msg.id === botMessageId 
+          ? { ...msg, text: `Error: ${error.message}`, isError: true, isStreaming: false }
+          : msg
+      ));
     } finally {
       setIsLoading(false);
     }
   };
 
   const clearChatHistory = async () => {
-    if (!patientId) return;
+    if (!patientId || !visitId) return;
 
     try {
       // Show loading state
       setIsLoading(true);
       
       await axios.post(`${apiUrl}/clear-chat-history`, {
-        patientId
+        patientId,
+        visitId
       }, {
         headers: {
           Authorization: sessionManager.getItem("token")
@@ -541,7 +638,7 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
       
       // Optional: Show a brief success message
       // You can add a toast notification here if you have one
-      console.log('Chat history cleared successfully');
+      console.log('Chat history cleared successfully for this visit');
       
     } catch (error) {
       console.error('Error clearing chat history:', error);
@@ -564,6 +661,34 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
   };
 
   if (!isOpen) return null;
+
+  // Check if both patientId and visitId are available
+  if (!patientId || !visitId) {
+    return (
+      <div
+        ref={chatWindowRef}
+        className="dental-chat-window"
+        style={{
+          position: 'fixed',
+          top: position.y,
+          left: position.x,
+          width: size.width,
+          height: size.height,
+          zIndex: 9999,
+          minWidth: '300px',
+          minHeight: '250px'
+        }}
+      >
+        <div className="bg-white rounded-lg shadow-xl border p-4">
+          <div className="text-center text-gray-600">
+            {!patientId ? 'Please select a patient first.' : 'Please select a visit first.'}
+            <br />
+            <small>Debug: patientId = {patientId}, visitId = {visitId}</small>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -744,6 +869,25 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
               </Button>
             )}
             <Button
+              onClick={() => {
+                console.log('Current session data:', {
+                  patientId: sessionManager.getItem('patientId'),
+                  visitId: sessionManager.getItem('visitId'),
+                  token: sessionManager.getItem("token") ? 'Present' : 'Missing'
+                });
+              }}
+              className="border-0 px-2 py-1 text-xs"
+              title="Debug session data"
+              style={{
+                whiteSpace: 'nowrap',
+                flexShrink: 0,
+                backgroundColor: '#6c757d',
+                color: 'white'
+              }}
+            >
+              Debug
+            </Button>
+            <Button
               onClick={toggle}
               className="text-black hover:text-black bg-primary border-0"
               aria-label="Close"
@@ -820,6 +964,19 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
                           </div>
                           
                           <div dangerouslySetInnerHTML={{ __html: parsePipeDelimitedTable(msg.text) }} />
+                          
+                          {/* Streaming indicator */}
+                          {msg.isStreaming && (
+                            <span 
+                              className="inline-block w-2 h-4 ml-1 bg-gray-400 animate-pulse"
+                              style={{
+                                width: '2px',
+                                height: '16px',
+                                backgroundColor: '#9ca3af',
+                                animation: 'pulse 1s cubic-bezier(0.4, 0, 0.6, 1) infinite'
+                              }}
+                            ></span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -938,7 +1095,10 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
 
         {/* Input Form */}
         <Form
-          onSubmit={handleSubmit}
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSendMessage();
+          }}
           className="border-t"
           style={{
             padding: '12px',
@@ -1010,75 +1170,7 @@ const DentalChatPopup = ({ isOpen, toggle, target }) => {
               )}
             </Button>
 
-            {/* Main Speaker Button for Input Field */}
-            <Button
-              type="button"
-              onClick={() => {
-                if (isSpeaking && currentSpeakingText === input) {
-                  stopSpeech();
-                } else {
-                  speakText(input);
-                }
-              }}
-              disabled={isLoading || isLoadingHistory || !input.trim()}
-              style={{
-                backgroundColor: 'transparent',
-                border: 'none',
-                borderRadius: '4px',
-                width: '40px',
-                height: '40px',
-                padding: '0',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                cursor: (isLoading || isLoadingHistory || !input.trim()) ? 'not-allowed' : 'pointer',
-                flexShrink: 0,
-                position: 'relative'
-              }}
-              title={(isSpeaking && currentSpeakingText === input) ? 'Stop Speaking' : 'Speak Input Text'}
-              onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
-              onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
-            >
-              <i 
-                className={(isSpeaking && currentSpeakingText === input) ? 'ion ion-md-close' : 'ion ion-md-volume-high'} 
-                style={{ 
-                  color: (isSpeaking && currentSpeakingText === input) ? '#dc3545' : '#6c757d', 
-                  fontSize: '18px' 
-                }} 
-              />
-            </Button>
 
-            {/* Main Pause/Resume Button (only show when speaking input text) */}
-            {isSpeaking && currentSpeakingText === input && (
-              <Button
-                type="button"
-                onClick={isPaused ? resumeSpeech : pauseSpeech}
-                style={{
-                  backgroundColor: 'transparent',
-                  border: 'none',
-                  borderRadius: '4px',
-                  width: '40px',
-                  height: '40px',
-                  padding: '0',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  cursor: 'pointer',
-                  flexShrink: 0
-                }}
-                title={isPaused ? 'Resume Speaking' : 'Pause Speaking'}
-                onMouseEnter={(e) => e.target.style.backgroundColor = '#f0f0f0'}
-                onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
-              >
-                <i 
-                  className={isPaused ? 'ion ion-md-play' : 'ion ion-md-pause'} 
-                  style={{ 
-                    color: isPaused ? '#28a745' : '#6c757d', 
-                    fontSize: '18px' 
-                  }} 
-                />
-              </Button>
-            )}
 
 
             

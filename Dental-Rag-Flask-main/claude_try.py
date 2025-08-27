@@ -8,6 +8,7 @@ from langchain.chains import LLMChain
 from uuid import uuid4
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
+import time # Added for chunked streaming
 
 # Load LLaMA model via Ollama
 llm = Ollama(model="mistral:latest")
@@ -513,6 +514,92 @@ Instructions:
         current_thread['chat_history'] = chat_history
     
     return "", chat_history
+
+### CHUNKED STREAMING CHAT FUNCTION ###
+def enhanced_chat_with_medbot_chunked(
+    question: str,
+    chat_history: List[Tuple[str, str]],
+    session_id: str,
+    current_thread_data: Optional[dict] = None,
+    current_patient_id: Optional[str] = None,
+    patient_name: Optional[str] = None,
+    patient_history: Optional[List[dict]] = None
+):
+    """
+    Chunked streaming version that processes response in small chunks for smooth delivery
+    """
+    current_thread = session_state.get_current_thread(session_id)
+    if not current_thread:
+        yield "Error: No active thread found."
+        return
+    
+    # Update thread data if provided
+    if current_thread_data:
+        current_thread.update(current_thread_data)
+    
+    # Update session patient info if provided
+    session = session_state.get_session(session_id)
+    if current_patient_id and patient_name:
+        session_state.set_current_patient(session_id, current_patient_id, patient_name, patient_history)
+
+    # Get patient context
+    patient_context = session_state.get_patient_context(session_id)
+    
+    # Build the prompt
+    prompt = f"""
+You are DentalMed AI, a specialized dental analysis assistant. Analyze the following dental data and provide insights.
+
+**PATIENT CONTEXT**:
+{patient_context}
+
+**CURRENT THREAD DATA**:
+- JSON Context: {current_thread.get('json_context', 'None')}
+- CDT Matches: {current_thread.get('cdt_matches', 'None')}
+- Findings: {current_thread.get('findings', 'None')}
+
+**CHAT HISTORY**:
+{format_chat_history(chat_history)}
+
+**QUESTION**: {question}
+
+**INSTRUCTIONS**:
+1. Provide a comprehensive analysis based on the dental data
+2. Focus on anomalies, procedures, and treatment recommendations
+3. Use clear, professional language
+4. Structure your response logically
+
+**RESPONSE**:
+"""
+    
+    try:
+        # Get the complete response from LLM
+        response = llm.invoke(prompt)
+        
+        # Process response in chunks for smooth streaming
+        words = response.split()
+        chunk_size = 2  # Send 2 words at a time for smooth reading
+        
+        # Stream chunks progressively
+        for i in range(0, len(words), chunk_size):
+            chunk = words[i:i + chunk_size]
+            content = ' '.join(chunk)
+            
+            # Add space before chunk (except first chunk)
+            if i > 0:
+                content = ' ' + content
+            
+            yield content
+            
+            # Very minimal delay for smooth streaming (2ms)
+            time.sleep(0.002)
+        
+        # Update chat history
+        chat_history.append((question, response))
+        
+    except Exception as e:
+        error_msg = f"Error generating response: {str(e)}"
+        yield error_msg
+        chat_history.append((question, error_msg))
 
 
 def handle_json_text_input(json_text, chat_history, session_id):

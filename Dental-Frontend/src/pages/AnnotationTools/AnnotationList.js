@@ -574,41 +574,94 @@ const AnnotationList = ({
       })
 
       const structuredData = structureAnnotationsForRAG(selectedAnomalyMap)
+      
+      console.log('Starting RAG job for CDT codes...');
+      
+      // Use backend streaming endpoint (which forwards to Flask)
+      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionManager.getItem("token")}`
+        },
+        body: JSON.stringify({
+          query: `create a treatment plan`,
+          json: structuredData,
+          patient_name: sessionStorage.getItem("patientId")
+        })
+      });
 
-      // const response = await axios.post(`${apiUrl}/chat-with-rag`, {
-      //     query: `create a treatment plan`,
-      //     json: structuredData, // Send the structured data
-      //   },
-      //   {
-      //   timeout: 600000,
-      //   headers: {
-      //     "Content-Type": "application/json",
-      //     Authorization: sessionManager.getItem("token"),
-      //   },
-      // })
-      const jobId = await startRagJob(structuredData)
-      console.log("Job started with ID:", jobId)
-      
-      const ragText = await pollRagJob(jobId)
-      console.log("RAG response received:", ragText)
-      
-      if (!ragText || !ragText.answer) {
-        console.error("Invalid RAG response:", ragText)
-        throw new Error("Invalid RAG response - missing answer")
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
-      
-      return parseCdtCodes(ragText.answer, convertedCdtCode, selectedAnomaly)
+
+      // Create a reader for the streaming response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      // Read the stream in real-time
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        // Decode the chunk and process it
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'token') {
+                // Add new token to the accumulated text
+                accumulatedText += data.content;
+                
+                // Update UI in real-time (you can add a loading state here)
+                console.log('Streaming CDT response:', accumulatedText);
+                
+              } else if (data.type === 'done') {
+                // Streaming is complete
+                console.log('RAG response received:', accumulatedText);
+                
+                if (accumulatedText.trim()) {
+                  // Process the complete response
+                  const ragText = accumulatedText;
+                  
+                  if (ragText && typeof ragText === 'string') {
+                    // Parse CDT codes from the response
+                    return parseCdtCodes(ragText, convertedCdtCode, selectedAnomaly);
+                  } else {
+                    console.error('Invalid RAG response format:', ragText);
+                    setTreatmentPlanError(true);
+                    return [];
+                  }
+                } else {
+                  setTreatmentPlanError(true);
+                  return [];
+                }
+                
+              } else if (data.type === 'error') {
+                // Handle error
+                console.error('RAG streaming error:', data.content);
+                setTreatmentPlanError(true);
+                return [];
+              }
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError);
+            }
+          }
+        }
+      }
+
     } catch (error) {
-      console.error("Error fetching CDT codes:", {
-        status: error?.response?.status,
-        data: error?.response?.data,
-        message: error?.message,
-        error: error
-      })
-      setTreatmentPlanError(true)
-      return []
+      console.error('Error fetching CDT codes:', error);
+      setTreatmentPlanError(true);
+      return [];
     }
-  }
+  };
 
   // Parse CDT codes from RAG response
   const parseCdtCodes = (ragResponse, convertedCdtCode, anomalyType) => {
@@ -963,35 +1016,100 @@ const AnnotationList = ({
   }
   const sendInitialContextToLLM = async () => {
     try {
-      // Structure all annotations into the required format
-      const structuredData = structureAnnotationsForRAG({})
-
-      // const response = await axios.post(`${apiUrl}/chat-with-rag`, {
-      //     query: `create a treatment plan`,
-      //     json: structuredData, // Send the structured data
-      //   },
-      //   {
-      //   timeout: 600000,
-      //   headers: {
-      //     "Content-Type": "application/json",
-      //     Authorization: sessionManager.getItem("token"),
-      //   },
-      // })
-      const jobId = await startRagJob(structuredData, "")
-      console.log("Initial context job started with ID:", jobId)
+      console.log('Sending initial context to LLM...');
       
-      const ragText = await pollRagJob(jobId)
-      console.log("Initial context RAG response:", ragText)
-    } catch (error) {
-      console.error("Error fetching CDT codes:", {
-        status: error?.response?.status,
-        data: error?.response?.data,
-        message: error?.message,
-        error: error
+      // Structure all annotations into the required format
+      const selectedAnomalyMap = {}
+      Object.values(globalCheckedAnnotations).forEach((anno) => {
+        const uniqueKey = getAnnotationUniqueKey(anno)
+        selectedAnomalyMap[uniqueKey] = {
+          label: anno.label,
+          segmentation: anno.segmentation,
+          metadata: anno.prerequisites || {},
+        }
       })
-      return []
+
+      const structuredData = structureAnnotationsForRAG(selectedAnomalyMap)
+      
+      // Use backend streaming endpoint (which forwards to Flask)
+      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionManager.getItem("token")}`
+        },
+        body: JSON.stringify({
+          query: `analyze these dental annotations and provide insights`,
+          json: structuredData,
+          patient_name: sessionStorage.getItem("patientId")
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      // Create a reader for the streaming response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      // Read the stream in real-time
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        // Decode the chunk and process it
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'token') {
+                // Add new token to the accumulated text
+                accumulatedText += data.content;
+                
+                // Update UI in real-time
+                console.log('Streaming initial context response:', accumulatedText);
+                
+              } else if (data.type === 'done') {
+                // Streaming is complete
+                console.log('Initial context RAG response:', accumulatedText);
+                
+                if (accumulatedText.trim()) {
+                  // Process the complete response
+                  const ragText = accumulatedText;
+                  
+                  if (ragText && typeof ragText === 'string') {
+                    // Handle the initial context response
+                    console.log('Initial context processed successfully');
+                    // You can add logic here to handle the initial context
+                  } else {
+                    console.error('Invalid initial context response format:', ragText);
+                  }
+                }
+                break;
+                
+              } else if (data.type === 'error') {
+                // Handle error
+                console.error('Initial context RAG streaming error:', data.content);
+                break;
+              }
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError);
+            }
+          }
+        }
+      }
+
+    } catch (error) {
+      console.error('Error sending initial context to LLM:', error);
     }
-  }
+  };
   useEffect(() => {
     // Reset checked annotations based on current annotations and persistent state
     sendInitialContextToLLM()

@@ -25,7 +25,7 @@ const Authmiddleware = (props) => {
           // Validate token with server
           const response = await axios.get(`${apiUrl}/getCDTCodes`, {
             headers: {
-              Authorization: `${token}`
+              Authorization: `Bearer ${token}`
             }
           });
 

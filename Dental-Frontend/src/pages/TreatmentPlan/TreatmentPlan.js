@@ -352,20 +352,68 @@ const DentalTreatmentPlan = (props) => {
 
   const fetchCdtCodesFromRAG = async (anomaly, convertedCdtCode) => {
     try {
-      const response = await fetch(`${apiUrl}/chat-with-rag`, {
+      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: sessionManager.getItem("token"),
+          Authorization: `Bearer ${sessionManager.getItem("token")}`,
         },
         body: JSON.stringify({
           query: `Give me the CDT codes for treating moderate risk ${anomaly} only. it should in the form D____.`,
-          promptTemplate: "You are an expert in dentistry"
+          json: [],
+          patient_name: sessionStorage.getItem("patientId") || "default"
         }),
       });
 
-      const ragText = await response.json();
-      return parseCdtCodes(ragText.answer, convertedCdtCode, anomaly);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      // Create a reader for the streaming response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+
+      // Read the stream in real-time
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        // Decode the chunk and process it
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'token') {
+                // Add new token to the accumulated text
+                accumulatedText += data.content;
+                
+              } else if (data.type === 'done') {
+                // Streaming is complete
+                if (accumulatedText.trim()) {
+                  return parseCdtCodes(accumulatedText, convertedCdtCode, anomaly);
+                } else {
+                  return [];
+                }
+                
+              } else if (data.type === 'error') {
+                // Handle error
+                console.error('RAG streaming error:', data.content);
+                return [];
+              }
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError);
+            }
+          }
+        }
+      }
+
+      return [];
     } catch (error) {
       if (error.status === 403 || error.status === 401) {
         sessionManager.removeItem('token');

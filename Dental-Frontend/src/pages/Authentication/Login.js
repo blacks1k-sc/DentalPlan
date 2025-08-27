@@ -67,7 +67,7 @@ const Login = props => {
         try {
           const response = await axios.get(`${apiUrl}/getCDTCodes`, {
             headers: {
-              Authorization: `${token}`
+              Authorization: `Bearer ${token}`
             }
           });
 
