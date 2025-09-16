@@ -352,16 +352,17 @@ const DentalTreatmentPlan = (props) => {
 
   const fetchCdtCodesFromRAG = async (anomaly, convertedCdtCode) => {
     try {
-      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
+              const response = await fetch('http://localhost:3000/api/chat_stream', {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${sessionManager.getItem("token")}`,
         },
         body: JSON.stringify({
+          patientId: sessionStorage.getItem("patientId") || "default",
+          visitId: sessionStorage.getItem("visitId") || "default",
           query: `Give me the CDT codes for treating moderate risk ${anomaly} only. it should in the form D____.`,
-          json: [],
-          patient_name: sessionStorage.getItem("patientId") || "default"
+          chat_history: []
         }),
       });
 

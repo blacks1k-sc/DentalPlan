@@ -1,5 +1,7 @@
 import json
 import os
+import time
+import random
 import pandas as pd
 from ollama_embedder import CDTEmbedder
 from langchain_community.llms import Ollama
@@ -8,11 +10,15 @@ from langchain.chains import LLMChain
 from uuid import uuid4
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
-import time # Added for chunked streaming
+import ollama
 
 # Load LLaMA model via Ollama
 llm = Ollama(model="mistral:latest")
 print("✅ (Ollama) model loaded.")
+
+# Typing speed configuration (characters per second)
+TYPING_SPEED = 30  # Adjust this: 20 = slow, 30 = medium, 50 = fast
+TYPING_DELAY = 1.0 / TYPING_SPEED  # Convert to delay per character
 
 # Load CDT Embedder
 cdt = CDTEmbedder("New_CDT.xlsx")
@@ -194,6 +200,185 @@ def extract_anomalies(data):
                 })
     return findings
 
+def format_chat_history(chat_history):
+    """Format chat history for LLM prompt"""
+    if not chat_history:
+        return "No previous conversation history."
+    
+    formatted_history = []
+    for i, (role, message) in enumerate(chat_history):
+        if role == "user":
+            formatted_history.append(f"User: {message}")
+        elif role == "assistant":
+            formatted_history.append(f"Assistant: {message}")
+        elif role == "system":
+            formatted_history.append(f"System: {message}")
+        else:
+            formatted_history.append(f"{role.title()}: {message}")
+    
+    return "\n".join(formatted_history)
+
+def transform_anomalies_for_llm(data, confidence_threshold=0.50):
+    """
+    Transform CV anomalies with confidence filtering and grouped labels for LLM processing.
+    
+    Args:
+        data: The transformed annotation data from backend
+        confidence_threshold: Minimum confidence score (default 0.50)
+    
+    Returns:
+        dict: Processed anomalies with grouped labels and confidence filtering
+    """
+    try:
+        # Initialize result structure
+        result = {
+            "anomalies_grouped": [],
+            "suspected_anomalies": [],
+            "confidence_threshold": confidence_threshold,
+            "total_anomalies": 0,
+            "filtered_anomalies": 0
+        }
+        
+        # Handle new comprehensive data structure
+        if "current_visit" in data:
+            current_visit = data["current_visit"]
+            anomalies_data = current_visit.get("anomalies", {}).get("teeth", [])
+        # Handle legacy data structure
+        elif "teeth" in data:
+            anomalies_data = data.get("teeth", [])
+        else:
+            return result
+        
+        # Group anomalies by type and tooth ranges
+        anomaly_groups = {}
+        suspected_anomalies = []
+        
+        for tooth_data in anomalies_data:
+            tooth_number = tooth_data.get('number', 'unknown')
+            anomalies = tooth_data.get("anomalies", [])
+            
+            for anomaly in anomalies:
+                description = anomaly.get("description", "")
+                metadata = anomaly.get("metadata", {})
+                confidence = metadata.get("confidence", 0.0)
+                
+                result["total_anomalies"] += 1
+                
+                # Apply confidence filter
+                if confidence >= confidence_threshold:
+                    result["filtered_anomalies"] += 1
+                    
+                    # Create grouped label for unknown tooth numbers
+                    if tooth_number == 'unknown' or tooth_number is None:
+                        # Group by anomaly type for unknown teeth
+                        if description not in anomaly_groups:
+                            anomaly_groups[description] = {
+                                "label": f"{description} [Unknown Location]",
+                                "teeth": [],
+                                "confidence": confidence,
+                                "count": 0
+                            }
+                        anomaly_groups[description]["count"] += 1
+                        anomaly_groups[description]["confidence"] = max(
+                            anomaly_groups[description]["confidence"], 
+                            confidence
+                        )
+                    else:
+                        # Handle known tooth numbers
+                        if description not in anomaly_groups:
+                            anomaly_groups[description] = {
+                                "label": description,
+                                "teeth": [],
+                                "confidence": confidence,
+                                "count": 0
+                            }
+                        
+                        # Add tooth to the group
+                        if tooth_number not in anomaly_groups[description]["teeth"]:
+                            anomaly_groups[description]["teeth"].append(tooth_number)
+                        
+                        anomaly_groups[description]["count"] += 1
+                        anomaly_groups[description]["confidence"] = max(
+                            anomaly_groups[description]["confidence"], 
+                            confidence
+                        )
+                else:
+                    # Add to suspected anomalies (below threshold)
+                    suspected_anomalies.append({
+                        "description": description,
+                        "tooth": tooth_number,
+                        "confidence": confidence,
+                        "metadata": metadata
+                    })
+        
+        # Convert grouped anomalies to final format
+        for description, group_data in anomaly_groups.items():
+            # Create final label with tooth ranges
+            if group_data["teeth"]:
+                # Sort teeth and create ranges
+                sorted_teeth = sorted([int(t) for t in group_data["teeth"] if str(t).isdigit()])
+                if sorted_teeth:
+                    # Create ranges for consecutive teeth
+                    ranges = []
+                    start = sorted_teeth[0]
+                    end = start
+                    
+                    for i in range(1, len(sorted_teeth)):
+                        if sorted_teeth[i] == end + 1:
+                            end = sorted_teeth[i]
+                        else:
+                            if start == end:
+                                ranges.append(str(start))
+                            else:
+                                ranges.append(f"{start}–{end}")
+                            start = sorted_teeth[i]
+                            end = start
+                    
+                    # Add the last range
+                    if start == end:
+                        ranges.append(str(start))
+                    else:
+                        ranges.append(f"{start}–{end}")
+                    
+                    final_label = f"{description} [{', '.join(ranges)}]"
+                else:
+                    final_label = f"{description} [Unknown Location]"
+            else:
+                final_label = f"{description} [Unknown Location]"
+            
+            result["anomalies_grouped"].append({
+                "label": final_label,
+                "description": description,
+                "confidence": group_data["confidence"],
+                "count": group_data["count"],
+                "teeth": group_data["teeth"]
+            })
+        
+        # Create by-tooth detailed list for non-bone-loss anomalies
+        by_tooth_details = []
+        for description, group_data in anomaly_groups.items():
+            if not description.lower().find("bone loss") != -1 and group_data["teeth"]:
+                for tooth in sorted(group_data["teeth"]):
+                    by_tooth_details.append(f"{description} on {tooth}")
+        
+        result["anomalies_by_tooth"] = by_tooth_details
+        
+        # Add suspected anomalies
+        result["suspected_anomalies"] = suspected_anomalies
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in transform_anomalies_for_llm: {str(e)}")
+        return {
+            "anomalies_grouped": [],
+            "suspected_anomalies": [],
+            "confidence_threshold": confidence_threshold,
+            "total_anomalies": 0,
+            "filtered_anomalies": 0,
+            "error": str(e)
+        }
+
 def format_finding_matches(findings):
     """Format ONLY findings with metadata for treatment plan"""
     formatted = []
@@ -225,35 +410,154 @@ def format_finding_matches(findings):
     return "\n\n".join(formatted), output_records
 
 def json_to_full_text(data):
-    """Convert entire JSON to comprehensive text context"""
+    """Convert comprehensive JSON structure to text context with clear separation"""
     parts = []
-    if "imagePath" in data:
-        parts.append(f"Image: {data['imagePath']} ({data['imageWidth']}x{data['imageHeight']})")
-    for tooth in data.get("teeth", []):
-        number = tooth['number']
-        tooth_info = [f"Tooth {number}:"]
-        anomalies = tooth.get("anomalies", [])
-        if anomalies:
-            anomaly_list = []
-            for anom in anomalies:
-                desc = anom.get("description", "")
-                metadata = anom.get("metadata", {})
-                if metadata:
-                    anomaly_list.append(f"{desc} (with metadata)")
+    
+    # Handle new comprehensive data structure
+    if "current_visit" in data:
+        current_visit = data["current_visit"]
+        
+        # Process grouped anomalies first (if available)
+        if "anomalies_grouped" in data and data["anomalies_grouped"]:
+            parts.append("**CURRENT VISIT ANOMALIES (GROUPED):**")
+            for anomaly in data["anomalies_grouped"]:
+                label = anomaly.get("label", "")
+                confidence = anomaly.get("confidence", 0.0)
+                count = anomaly.get("count", 1)
+                if count > 1:
+                    parts.append(f"• {label} (confidence: {confidence:.2f}, count: {count})")
                 else:
-                    anomaly_list.append(f"{desc}")
-            tooth_info.append(f"  Anomalies: {', '.join(anomaly_list)}")
-        procedures = tooth.get("procedures", [])
-        if procedures:
-            proc_list = [proc.get("description", "") for proc in procedures]
-            tooth_info.append(f"  Procedures: {', '.join(proc_list)}")
-        foreign_objects = tooth.get("foreign_objects", [])
-        if foreign_objects:
-            foreign_list = [obj.get("description", "") for obj in foreign_objects]
-            tooth_info.append(f"  Foreign Objects: {', '.join(foreign_list)}")
-        if len(tooth_info) > 1:
-            parts.append("\n".join(tooth_info))
-    return "\n\n".join(parts)
+                    parts.append(f"• {label} (confidence: {confidence:.2f})")
+        
+        # Process suspected anomalies (below confidence threshold)
+        if "suspected_anomalies" in data and data["suspected_anomalies"]:
+            parts.append("**SUSPECTED ANOMALIES (LOW CONFIDENCE):**")
+            for anomaly in data["suspected_anomalies"]:
+                desc = anomaly.get("description", "")
+                tooth = anomaly.get("tooth", "Unknown")
+                confidence = anomaly.get("confidence", 0.0)
+                parts.append(f"• {desc} on Tooth {tooth} (confidence: {confidence:.2f})")
+        
+        # Fallback to original anomaly processing if no grouped anomalies
+        if not data.get("anomalies_grouped"):
+            anomaly_parts = []
+            if "anomalies" in current_visit and "teeth" in current_visit["anomalies"]:
+                for tooth in current_visit["anomalies"]["teeth"]:
+                    number = tooth.get('number', 'Unknown')
+                    anomalies = tooth.get("anomalies", [])
+                    if anomalies:
+                        anomaly_list = []
+                        for anom in anomalies:
+                            desc = anom.get("description", "")
+                            metadata = anom.get("metadata", {})
+                            confidence = metadata.get("confidence", "")
+                            if confidence:
+                                anomaly_list.append(f"{desc} (confidence: {confidence:.2f})")
+                            else:
+                                anomaly_list.append(f"{desc}")
+                        anomaly_parts.append(f"Tooth {number}: {', '.join(anomaly_list)}")
+            
+            if anomaly_parts:
+                parts.append("**CURRENT VISIT ANOMALIES:**")
+                parts.extend(anomaly_parts)
+        
+        # Process procedures
+        procedure_parts = []
+        if "procedures" in current_visit and "teeth" in current_visit["procedures"]:
+            for tooth in current_visit["procedures"]["teeth"]:
+                number = tooth.get('number', 'Unknown')
+                procedures = tooth.get("procedures", [])
+                if procedures:
+                    proc_list = []
+                    for proc in procedures:
+                        desc = proc.get("description", "")
+                        metadata = proc.get("metadata", {})
+                        confidence = metadata.get("confidence", "")
+                        if confidence:
+                            proc_list.append(f"{desc} (confidence: {confidence:.2f})")
+                        else:
+                            proc_list.append(f"{desc}")
+                    procedure_parts.append(f"Tooth {number}: {', '.join(proc_list)}")
+        
+        # Process foreign objects
+        foreign_object_parts = []
+        if "foreign_objects" in current_visit and "teeth" in current_visit["foreign_objects"]:
+            for tooth in current_visit["foreign_objects"]["teeth"]:
+                number = tooth.get('number', 'Unknown')
+                foreign_objects = tooth.get("foreign_objects", [])
+                if foreign_objects:
+                    foreign_list = []
+                    for obj in foreign_objects:
+                        desc = obj.get("description", "")
+                        metadata = obj.get("metadata", {})
+                        confidence = metadata.get("confidence", "")
+                        if confidence:
+                            foreign_list.append(f"{desc} (confidence: {confidence:.2f})")
+                        else:
+                            foreign_list.append(f"{desc}")
+                    foreign_object_parts.append(f"Tooth {number}: {', '.join(foreign_list)}")
+        
+        # Format with clear sections
+        if procedure_parts:
+            parts.append("**CURRENT VISIT PROCEDURES:**")
+            parts.extend(procedure_parts)
+        
+        if foreign_object_parts:
+            parts.append("**CURRENT VISIT FOREIGN OBJECTS:**")
+            parts.extend(foreign_object_parts)
+    
+    # Handle legacy data structure for backward compatibility
+    elif "teeth" in data:
+        if "imagePath" in data:
+            parts.append(f"Image: {data['imagePath']} ({data['imageWidth']}x{data['imageHeight']})")
+        
+        anomaly_parts = []
+        procedure_parts = []
+        foreign_object_parts = []
+        
+        for tooth in data.get("teeth", []):
+            number = tooth['number']
+            
+            # Process anomalies
+            anomalies = tooth.get("anomalies", [])
+            if anomalies:
+                anomaly_list = []
+                for anom in anomalies:
+                    desc = anom.get("description", "")
+                    metadata = anom.get("metadata", {})
+                    confidence = metadata.get("confidence", "")
+                    if confidence:
+                        anomaly_list.append(f"{desc} (confidence: {confidence:.2f})")
+                    else:
+                        anomaly_list.append(f"{desc}")
+                anomaly_parts.append(f"Tooth {number}: {', '.join(anomaly_list)}")
+            
+            # Process procedures
+            procedures = tooth.get("procedures", [])
+            if procedures:
+                proc_list = [proc.get("description", "") for proc in procedures]
+                procedure_parts.append(f"Tooth {number}: {', '.join(proc_list)}")
+            
+            # Process foreign objects
+            foreign_objects = tooth.get("foreign_objects", [])
+            if foreign_objects:
+                foreign_list = [obj.get("description", "") for obj in foreign_objects]
+                foreign_object_parts.append(f"Tooth {number}: {', '.join(foreign_list)}")
+        
+        # Format with clear sections
+        if anomaly_parts:
+            parts.append("**CURRENT ANOMALIES:**")
+            parts.extend(anomaly_parts)
+        
+        if procedure_parts:
+            parts.append("**CURRENT PROCEDURES:**")
+            parts.extend(procedure_parts)
+        
+        if foreign_object_parts:
+            parts.append("**FOREIGN OBJECTS:**")
+            parts.extend(foreign_object_parts)
+    
+    return "\n".join(parts) if parts else "No dental findings detected"
 
 ### SIMPLIFIED CHAT FUNCTION (NO SQL) ###
 def enhanced_chat_with_medbot(
@@ -470,29 +774,110 @@ Answer:
 
     # ===== 5. DEFAULT PATIENT-SPECIFIC PROMPT =====
     else:
+        # Parse current visit data to separate anomalies from procedures
+        current_data = current_thread.get('json_context', '')
+        current_anomalies = []
+        current_procedures = []
+        
+        # Extract current visit anomalies and procedures from json_context
+        if current_data:
+            try:
+                import json
+                # Try to parse the json_context if it's JSON format
+                if current_data.strip().startswith('{'):
+                    parsed_data = json.loads(current_data)
+                    for tooth in parsed_data.get('teeth', []):
+                        tooth_num = tooth.get('number', 'Unknown')
+                        for anomaly in tooth.get('anomalies', []):
+                            current_anomalies.append(f"Tooth {tooth_num}: {anomaly.get('description', 'Unknown anomaly')}")
+                        for procedure in tooth.get('procedures', []):
+                            current_procedures.append(f"Tooth {tooth_num}: {procedure.get('description', 'Unknown procedure')}")
+                else:
+                    # If it's text format, extract anomalies and procedures
+                    lines = current_data.split('\n')
+                    for line in lines:
+                        if 'Anomalies:' in line:
+                            current_anomalies.append(line.strip())
+                        elif 'Procedures:' in line:
+                            current_procedures.append(line.strip())
+            except:
+                # Fallback: treat entire context as anomalies if parsing fails
+                current_anomalies = [current_data] if current_data else []
+        
+        # Format the data sections
+        current_anomalies_text = "\n".join(current_anomalies) if current_anomalies else "No current anomalies detected"
+        current_procedures_text = "\n".join(current_procedures) if current_procedures else "No current procedures listed"
+        
         prompt = f"""
-You are DentalMed AI, a knowledgeable dental assistant AI with access to comprehensive patient information.
+You are DentalMed AI, a knowledgeable dental assistant AI with comprehensive access to patient information.
 
-You have been provided with:
-1. Complete dental case information including all teeth, anomalies, procedures, and foreign objects
-2. Relevant CDT codes for anomalies that have metadata
+**COMPREHENSIVE DATA AWARENESS:**
+You have access to multiple types of patient data. It is ESSENTIAL that you understand and appropriately respond to questions about any of these data types:
 
-**PATIENT HISTORY (SUMMARY)**:
-{patient_context}
+1. **CURRENT VISIT ANOMALIES** = New findings from today's X-ray analysis (conditions requiring attention)
+2. **CURRENT VISIT PROCEDURES** = Procedures performed during current visit (treatments done today)
+3. **CURRENT VISIT FOREIGN OBJECTS** = Orthodontic appliances, implants, etc. detected in current visit
+4. **PATIENT HISTORY** = Historical data from previous visits (past findings and treatments)
 
-**CURRENT VISIT**:
+**CURRENT VISIT DATA:**
 {current_thread['json_context']}
+
+**PATIENT HISTORY** (Previous visits and treatments):
+{patient_context}
 
 **Available CDT Treatment Codes**:
 {current_thread['cdt_matches']}
 
 **Question**: {question}
 
-Instructions:
-- Use patient history to provide informed responses
-- Reference previous visits when relevant
-- Note any patterns or changes over time
-- Provide continuity of care recommendations
+**CRITICAL: COMPREHENSIVE ANOMALY REPORTING**
+Regardless of the question type, you MUST ALWAYS:
+1. **FIRST**: Report ALL detected anomalies from the current visit data
+2. **THEN**: Provide your specific response to the question
+3. **NEVER**: Filter, omit, or selectively report anomalies based on question type
+
+**INTELLIGENT RESPONSE GUIDELINES:**
+You are now comprehensively aware of ALL patient data. Respond intelligently to ANY question type:
+
+**For Anomaly Questions** ("what are the anomalies?", "what problems do you see?"):
+- Focus on CURRENT VISIT ANOMALIES only
+- Provide specific details about each anomaly
+- Suggest appropriate treatment options
+
+**For Procedure Questions** ("what procedures were done?", "what treatments exist?"):
+- Distinguish between current visit procedures vs historical procedures
+- Provide details about each procedure type and location
+
+**For Foreign Object Questions** ("what appliances are present?", "what orthodontic work?"):
+- Reference CURRENT VISIT FOREIGN OBJECTS
+- Explain the purpose and implications of each object
+
+**For General Questions** ("what do you see?", "summarize the findings"):
+- Provide a comprehensive overview of ALL current visit data
+- Organize by data type (anomalies, procedures, foreign objects)
+- Include relevant historical context
+
+**For Treatment Planning Questions** ("what should be done?", "recommendations?", "generate a treatment plan"):
+- **CRITICAL**: Report ALL CURRENT VISIT ANOMALIES first
+- Then consider ALL current findings (anomalies, procedures, foreign objects)
+- Provide evidence-based treatment recommendations for EACH finding
+- Reference appropriate CDT codes for EACH anomaly
+
+**For Comparison Questions** ("how has this changed?", "compare with previous visits"):
+- Use both current visit data and patient history
+- Highlight changes, improvements, or new concerns
+
+**MANDATORY FORMAT FOR ALL RESPONSES:**
+1. **ANOMALIES DETECTED**: List ALL anomalies found in current visit
+2. **SPECIFIC RESPONSE**: Answer the user's question based on ALL findings
+3. **COMPREHENSIVE COVERAGE**: Ensure no findings are omitted
+
+**Always:**
+- Be specific about tooth numbers and conditions
+- Include confidence levels when available
+- Provide evidence-based recommendations
+- Maintain professional dental terminology
+- **NEVER filter or omit any detected anomalies**
 
 **Response**:
 """
@@ -515,8 +900,9 @@ Instructions:
     
     return "", chat_history
 
-### CHUNKED STREAMING CHAT FUNCTION ###
-def enhanced_chat_with_medbot_chunked(
+
+### STREAMING CHAT FUNCTION ###
+def enhanced_chat_with_medbot_stream(
     question: str,
     chat_history: List[Tuple[str, str]],
     session_id: str,
@@ -526,11 +912,11 @@ def enhanced_chat_with_medbot_chunked(
     patient_history: Optional[List[dict]] = None
 ):
     """
-    Chunked streaming version that processes response in small chunks for smooth delivery
+    Streaming version of enhanced_chat_with_medbot that yields text chunks
     """
     current_thread = session_state.get_current_thread(session_id)
     if not current_thread:
-        yield "Error: No active thread found."
+        yield "Error: No session found"
         return
     
     # Update thread data if provided
@@ -544,62 +930,272 @@ def enhanced_chat_with_medbot_chunked(
 
     # Get patient context
     patient_context = session_state.get_patient_context(session_id)
+
+    # ===== 1. CHECK IF USER EXPLICITLY REQUESTS PAST JSONS =====
+    history_keywords = ["full history", "all past data", "complete json history", "raw visit data"]
+    is_history_request = any(keyword in question.lower() for keyword in history_keywords)
     
-    # Build the prompt
-    prompt = f"""
-You are DentalMed AI, a specialized dental analysis assistant. Analyze the following dental data and provide insights.
+    if is_history_request:
+        history = session.get('patient_history', [])
+        if not history:
+            yield "No past visit data available."
+            return
+        
+        prompt = f"""
+You are DentalMed AI. The user requested FULL PAST JSON DATA for analysis.
 
-**PATIENT CONTEXT**:
-{patient_context}
-
-**CURRENT THREAD DATA**:
-- JSON Context: {current_thread.get('json_context', 'None')}
-- CDT Matches: {current_thread.get('cdt_matches', 'None')}
-- Findings: {current_thread.get('findings', 'None')}
-
-**CHAT HISTORY**:
-{format_chat_history(chat_history)}
-
-**QUESTION**: {question}
+**PATIENT**: {session['patient_name']}
+**TOTAL VISITS**: {len(history)}
 
 **INSTRUCTIONS**:
-1. Provide a comprehensive analysis based on the dental data
-2. Focus on anomalies, procedures, and treatment recommendations
-3. Use clear, professional language
-4. Structure your response logically
+1. Provide a structured overview of ALL raw JSON visits
+2. Highlight key changes in anomalies/procedures
+3. Do NOT summarize - show exact data differences
+4. Include visit dates and patient progression
+5. Format as organized sections per visit
 
-**RESPONSE**:
+**ALL VISIT DATA**:
+{json.dumps(history, indent=2)}
+
+**Question**: {question}
+
+**Response**:
+"""
+        try:
+            # Use direct Ollama client for streaming
+            stream = ollama.chat(
+                model='mistral:latest',
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=True
+            )
+            
+            for chunk in stream:
+                if chunk.get('message', {}).get('content'):
+                    content = chunk['message']['content']
+                    # Yield content directly for real-time streaming
+                    yield content
+            return
+        except Exception as e:
+            yield f"⚠️ Error processing history request: {str(e)}"
+            return
+
+    # ===== 2. GENERAL DENTAL QUESTIONS (NO JSONs) =====
+    general_dental_keywords = ["what is", "how to", "explain", "difference between", "standard treatment"]
+    is_general_question = any(keyword in question.lower() for keyword in general_dental_keywords)
+    
+    if is_general_question and current_thread['json_context'] is None:
+        prompt = f"""
+You are DentalMed AI, an expert dental assistant with comprehensive knowledge of:
+- Dental procedures and terminology
+- CDT codes and their applications
+- Common dental conditions and treatments
+- Best practices in dentistry
+
+{patient_context if patient_context else ""}
+
+Please provide a professional response to this question:
+
+Question: {question}
+
+Guidelines:
+1. Be accurate and cite sources if possible
+2. Use simple language for patient questions
+3. Include relevant CDT codes when appropriate
+4. For treatment questions, mention alternatives
+5. Keep responses under 200 words unless complex
+
+Response:
+"""
+        try:
+            # Use direct Ollama client for streaming
+            stream = ollama.chat(
+                model='mistral:latest',
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=True
+            )
+            
+            for chunk in stream:
+                if chunk.get('message', {}).get('content'):
+                    content = chunk['message']['content']
+                    # Yield content directly for real-time streaming
+                    yield content
+            return
+        except Exception as e:
+            yield f"⚠️ Error answering general question: {str(e)}"
+            return
+
+    # ===== 3. TREATMENT PLAN (CURRENT JSON ONLY) =====
+    is_treatment_plan_request = any(keyword in question.lower() for keyword in 
+                                  ["treatment plan", "create treatment", "treatment recommendation", 
+                                   "cdt codes", "treatment codes"])
+    
+    if is_treatment_plan_request:
+        current_case_context = current_thread['json_context']
+        prompt = f"""
+You are MedBot, a precise dental assistant AI. Create a treatment plan ONLY for teeth with anomaly metadata.
+
+**STRICT INSTRUCTIONS**:
+1. ONLY include teeth where anomalies have metadata (ignore others)
+2. For each finding, provide:
+   - Tooth number
+   - Exact description from metadata
+   - Recommended CDT code(s)
+3. Format as a clean table
+4. Never invent data - skip if no metadata exists
+5. If no CDT code is found, write: "No matching CDT code found."
+6. Provide ONLY the most clinically appropriate codes, not all possibilities.
+
+**Teeth with Metadata**:
+{current_thread['cdt_matches'] if current_thread['cdt_matches'] else "No teeth with metadata found"}
+
+**Output Format**:
+| Tooth | Finding Description | Metadata | Recommended CDT Codes |
+|-------|---------------------|----------|-----------------------|
+| ...   | ...                 | ...      | ...                   |
+
+**Formatting Requirements**:
+1. Keep each cell content SHORT and concise
+2. Break long descriptions into key points only  
+3. Each row should fit on one line
+
+**REMEMBER**: You are making clinical decisions - choose the most appropriate treatment.
+
+**Current Dental Case ONLY**:
+{current_case_context}
+
+**Available CDT Codes for Anomalies with Metadata**:
+{current_thread['cdt_matches']}
+
+**Your Request**: {question}
+
+Answer:
+"""
+        try:
+            # Use direct Ollama client for streaming
+            stream = ollama.chat(
+                model='mistral:latest',
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=True
+            )
+            
+            for chunk in stream:
+                if chunk.get('message', {}).get('content'):
+                    content = chunk['message']['content']
+                    # Yield content directly for real-time streaming
+                    yield content
+            return
+        except Exception as e:
+            yield f"⚠️ Error creating treatment plan: {str(e)}"
+            return
+
+    # ===== 4. COMPREHENSIVE ANALYSIS (CURRENT + HISTORY) =====
+    current_case_context = current_thread['json_context']
+    patient_history_context = session.get('patient_history', [])
+    
+    # Debug: Print what data is being sent to LLM
+    print(f"🔍 DEBUG: current_case_context type: {type(current_case_context)}")
+    print(f"🔍 DEBUG: current_case_context content: {current_case_context}")
+    print(f"🔍 DEBUG: patient_history_context length: {len(patient_history_context)}")
+    print(f"🔍 DEBUG: Question: {question}")
+    
+    prompt = f"""
+You are DentalMed AI, a knowledgeable dental assistant AI with comprehensive access to patient information.
+
+**COMPREHENSIVE DATA AWARENESS:**
+You have access to multiple types of patient data. It is ESSENTIAL that you understand and appropriately respond to questions about any of these data types:
+
+1. **CURRENT VISIT ANOMALIES** = New findings from today's X-ray analysis (conditions requiring attention)
+2. **CURRENT VISIT PROCEDURES** = Procedures performed during current visit (treatments done today)
+3. **CURRENT VISIT FOREIGN OBJECTS** = Orthodontic appliances, implants, etc. detected in current visit
+4. **PATIENT HISTORY** = Historical data from previous visits (past findings and treatments)
+
+**CURRENT VISIT DATA:**
+{current_case_context}
+
+**PATIENT HISTORY** (Previous visits and treatments):
+{patient_context}
+
+**Available CDT Treatment Codes**:
+{current_thread['cdt_matches']}
+
+**Question**: {question}
+
+**CRITICAL: COMPREHENSIVE ANOMALY REPORTING**
+Regardless of the question type, you MUST ALWAYS:
+1. **FIRST**: Report ALL detected anomalies from the current visit data
+2. **THEN**: Provide your specific response to the question
+3. **NEVER**: Filter, omit, or selectively report anomalies based on question type
+
+**INTELLIGENT RESPONSE GUIDELINES:**
+You are now comprehensively aware of ALL patient data. Respond intelligently to ANY question type:
+
+**For Anomaly Questions** ("what are the anomalies?", "what problems do you see?"):
+- Focus on CURRENT VISIT ANOMALIES only
+- Provide specific details about each anomaly
+- Suggest appropriate treatment options
+
+**For Procedure Questions** ("what procedures were done?", "what treatments exist?"):
+- Distinguish between current visit procedures vs historical procedures
+- Provide details about each procedure type and location
+
+**For Foreign Object Questions** ("what appliances are present?", "what orthodontic work?"):
+- Reference CURRENT VISIT FOREIGN OBJECTS
+- Explain the purpose and implications of each object
+
+**For General Questions** ("what do you see?", "summarize the findings"):
+- Provide a comprehensive overview of ALL current visit data
+- Organize by data type (anomalies, procedures, foreign objects)
+- Include relevant historical context
+
+**For Treatment Planning Questions** ("what should be done?", "recommendations?", "generate a treatment plan"):
+- **CRITICAL**: Report ALL CURRENT VISIT ANOMALIES first
+- Then consider ALL current findings (anomalies, procedures, foreign objects)
+- Provide evidence-based treatment recommendations for EACH finding
+- Reference appropriate CDT codes for EACH anomaly
+
+**For Comparison Questions** ("how has this changed?", "compare with previous visits"):
+- Use both current visit data and patient history
+- Highlight changes, improvements, or new concerns
+
+**MANDATORY FORMAT FOR ALL RESPONSES:**
+1. **ANOMALIES DETECTED**: List ALL anomalies found in current visit
+2. **SPECIFIC RESPONSE**: Answer the user's question based on ALL findings
+3. **COMPREHENSIVE COVERAGE**: Ensure no findings are omitted
+
+**Always:**
+- Be specific about tooth numbers and conditions
+- Include confidence levels when available
+- Provide evidence-based recommendations
+- Maintain professional dental terminology
+- **NEVER filter or omit any detected anomalies**
+
+**Response**:
 """
     
     try:
-        # Get the complete response from LLM
-        response = llm.invoke(prompt)
+        print(f"Starting LLM stream for comprehensive analysis")
+        chunk_count = 0
         
-        # Process response in chunks for smooth streaming
-        words = response.split()
-        chunk_size = 2  # Send 2 words at a time for smooth reading
+        # Use direct Ollama client for streaming
+        stream = ollama.chat(
+            model='mistral:latest',
+            messages=[{'role': 'user', 'content': prompt}],
+            stream=True
+        )
         
-        # Stream chunks progressively
-        for i in range(0, len(words), chunk_size):
-            chunk = words[i:i + chunk_size]
-            content = ' '.join(chunk)
-            
-            # Add space before chunk (except first chunk)
-            if i > 0:
-                content = ' ' + content
-            
-            yield content
-            
-            # Very minimal delay for smooth streaming (2ms)
-            time.sleep(0.002)
+        for chunk in stream:
+            if chunk.get('message', {}).get('content'):
+                content = chunk['message']['content']
+                chunk_count += 1
+                print(f"LLM chunk {chunk_count}: {content[:30]}...")
+                
+                # Yield content directly for real-time streaming (no artificial delays)
+                yield content
         
-        # Update chat history
-        chat_history.append((question, response))
-        
+        print(f"LLM streaming completed. Total chunks: {chunk_count}")
     except Exception as e:
-        error_msg = f"Error generating response: {str(e)}"
-        yield error_msg
-        chat_history.append((question, error_msg))
+        print(f"LLM streaming error: {str(e)}")
+        yield f"⚠️ Error processing your question: {str(e)}"
 
 
 def handle_json_text_input(json_text, chat_history, session_id):

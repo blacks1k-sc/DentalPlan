@@ -27,7 +27,11 @@ const AnnotationPage = () => {
   const apiUrl = process.env.REACT_APP_NODEAPIURL;
   const [exitClick, setExitClick] = useState(false);
   const [navigateToTreatmentPlan, setNavigateToTreatmentPlan] = useState(false);
-  const [annotations, setAnnotations] = useState([]);
+  const [annotations, setAnnotations] = useState(() => {
+    // Try to restore annotations from localStorage
+    const saved = localStorage.getItem('dental-annotations');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [hiddenAnnotations, setHiddenAnnotations] = useState([]);
   const [drawingBox, setDrawingBox] = useState(null);
   const [showDialog, setShowDialog] = useState(false);
@@ -129,6 +133,9 @@ const AnnotationPage = () => {
   const [imageGroup, setImageGroup] = useState("")
   const [showOriginalLabels, setShowOriginalLabels] = useState(false)
   const [showConfidence, setShowConfidence] = useState(false)
+  
+  // Ref to track if annotations have been drawn to prevent double-drawing
+  const annotationsDrawnRef = useRef(false);
   const fetchNotesContent = async () => {
     try {
       const response = await axios.get(`${apiUrl}/notes-content?visitID=` + sessionManager.getItem('visitId'),
@@ -274,6 +281,12 @@ const AnnotationPage = () => {
     return hex; // If not hex, return original color (handles named colors)
   }
   const drawAnnotations = (ctx, image, x, y, scale, selectedAnnotation, areaScale) => {
+    // Comprehensive null checks to prevent crashes
+    if (!ctx || !image || !annotations || !Array.isArray(annotations)) {
+      console.warn('drawAnnotations: Invalid parameters:', { ctx: !!ctx, image: !!image, annotations: !!annotations });
+      return;
+    }
+    
     const fontSize = Math.max(9, Math.ceil(12 / (1000 / image.width)));
     // Scale the spacing values based on image size
     let labelPadding = Math.ceil(5 / (1000 / image.width));
@@ -283,7 +296,7 @@ const AnnotationPage = () => {
     // First find the lower jaw annotation for overlap checking
     let lowerJawVertices = null;
     annotations.forEach((anno) => {
-      if (anno.label === "lower jaw") {
+      if (anno && anno.label === "lower jaw") {
         if (model === "segmentation") {
           lowerJawVertices = anno.segmentation ? anno.segmentation : anno.bounding_box;
         } else {
@@ -518,14 +531,26 @@ const AnnotationPage = () => {
     }
     else {
       annotations.forEach((anno, index) => {
+        // Comprehensive null check for each annotation
+        if (!anno || typeof anno !== 'object') {
+          console.warn('Invalid annotation object:', anno);
+          return; // Skip this annotation
+        }
+        
         // Get the appropriate confidence level based on image group
         const confidenceField = `${imageGroup}_confidence`;
-        const confidenceThreshold = confidenceLevels[anno.label.toLowerCase()] ?
+        const confidenceThreshold = (confidenceLevels && anno.label && confidenceLevels[anno.label.toLowerCase()]) ?
           confidenceLevels[anno.label.toLowerCase()][confidenceField] || 0.001 :
           0.001;
 
-        if (!hiddenAnnotations.includes(index) && anno.confidence >= confidenceThreshold) {
+        if ((!hiddenAnnotations || !Array.isArray(hiddenAnnotations) || !hiddenAnnotations.includes(index)) && anno.confidence >= confidenceThreshold) {
           if (anno.label === 'Line') {
+            // Add null checks for Line annotation
+            if (!anno.vertices || !Array.isArray(anno.vertices) || anno.vertices.length < 2) {
+              console.warn('Invalid Line annotation vertices:', anno);
+              return; // Skip this annotation
+            }
+            
             // Draw line
             ctx.beginPath();
             ctx.moveTo(anno.vertices[0].x * scale, anno.vertices[0].y * scale);
@@ -548,32 +573,55 @@ const AnnotationPage = () => {
               ctx.fillText(`${length.toFixed(2)} mm`, midX, midY);
             }
           } else {
-            const { left, top, width, height } = getBoxDimensions(anno.vertices.map(v => ({ x: v.x * scale, y: v.y * scale })));
+            // Try to use vertices first, then fall back to bounding_box
+            let vertices = anno.vertices;
+            if (!vertices || !Array.isArray(vertices) || vertices.length === 0) {
+              // Fall back to bounding_box if vertices are invalid
+              if (anno.bounding_box && Array.isArray(anno.bounding_box) && anno.bounding_box.length > 0) {
+                vertices = anno.bounding_box;
+                console.log('Using bounding_box as fallback for annotation:', anno.label);
+              } else {
+                console.warn('No valid vertices or bounding_box for annotation:', anno);
+                return; // Skip this annotation
+              }
+            }
+            
+            const boxDimensions = getBoxDimensions(vertices.map(v => ({ x: v.x * scale, y: v.y * scale })));
+            if (!boxDimensions) {
+              console.warn('Could not calculate box dimensions for annotation:', anno);
+              return; // Skip this annotation
+            }
+            const { left, top, width, height } = boxDimensions;
 
             ctx.beginPath();
-            ctx.moveTo(anno.vertices[0].x * scale, anno.vertices[0].y * scale);
+            ctx.moveTo(vertices[0].x * scale, vertices[0].y * scale);
 
-            for (let i = 1; i < anno.vertices.length; i++) {
-              ctx.lineTo(anno.vertices[i].x * scale, anno.vertices[i].y * scale);
+            for (let i = 1; i < vertices.length; i++) {
+              ctx.lineTo(vertices[i].x * scale, vertices[i].y * scale);
             }
             ctx.closePath();
-            if (index === hoveredAnnotation) {
+            if (hoveredAnnotation !== null && index === hoveredAnnotation) {
               ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
               ctx.fill();
             }
-            ctx.strokeStyle = labelColors[anno.label.toLowerCase()] || 'white';
+            ctx.strokeStyle = (labelColors && anno.label && labelColors[anno.label.toLowerCase()]) || 'white';
             ctx.lineWidth = Math.ceil(2 / (1000 / image.width));
             ctx.stroke();
-            if (selectedAnnotation !== anno) {
-              const area = calculatePolygonArea(anno.vertices.map(v => ({ x: v.x * scale, y: v.y * scale })), areaScale).toFixed(2);
+            if (selectedAnnotation && selectedAnnotation !== anno) {
+              const area = calculatePolygonArea(vertices.map(v => ({ x: v.x * scale, y: v.y * scale })), areaScale);
+              if (area === null || area === undefined) {
+                console.warn('Could not calculate area for annotation:', anno);
+                return; // Skip this annotation
+              }
+              const areaText = area.toFixed(2);
 
               // Prepare label text
               let labelText = '';
-              if ((isArea && showLabel) || (isArea && index === hoveredAnnotation)) {
-                labelText = showOriginalLabels && anno.original_label ? `${anno.original_label} (${area} mm²)` : `${anno.label} (${area} mm²)`;
+              if ((isArea && showLabel) || (isArea && hoveredAnnotation !== null && index === hoveredAnnotation)) {
+                labelText = (showOriginalLabels && anno.original_label) ? `${anno.original_label} (${areaText} mm²)` : `${anno.label} (${areaText} mm²)`;
               }
-              else if (showLabel || index === hoveredAnnotation) {
-                labelText = showOriginalLabels && anno.original_label ? `${anno.original_label}` : `${anno.label}`;
+              else if (showLabel || (hoveredAnnotation !== null && index === hoveredAnnotation)) {
+                labelText = (showOriginalLabels && anno.original_label) ? `${anno.original_label}` : `${anno.label}`;
               }
               if (labelText !== '') {
                 // Parse label value for comparison
@@ -590,12 +638,14 @@ const AnnotationPage = () => {
                 let centerX, rectY, labelY;
 
                 // Special handling for bitewing image tooth numbers
-                if (imageGroup === 'bitewing' && isToothNumber) {
+                if (imageGroup && imageGroup === 'bitewing' && isToothNumber) {
                   // For bitewing images, place tooth numbers inside the tooth
                   const centroid = getPolygonCentroid(anno.vertices);
-                  centerX = centroid.x - (textWidth / 2);
-                  rectY = centroid.y - (textHeight / 2) - labelPadding;
-                  labelY = rectY + textHeight + labelPadding;
+                  if (centroid) {
+                    centerX = centroid.x - (textWidth / 2);
+                    rectY = centroid.y - (textHeight / 2) - labelPadding;
+                    labelY = rectY + textHeight + labelPadding;
+                  }
                 } else {
                   // Standard positioning logic for non-bitewing or non-tooth numbers
                   centerX = left + (width / 2) - (textWidth / 2);
@@ -628,7 +678,7 @@ const AnnotationPage = () => {
                 }
 
                 // Draw background and text
-                ctx.fillStyle = labelColors[anno.label.toLowerCase()] || '#ffffff'
+                ctx.fillStyle = (labelColors && anno.label && labelColors[anno.label.toLowerCase()]) || '#ffffff'
                 ctx.fillRect(centerX - labelPadding, rectY, textWidth + labelPadding * 2, textHeight + labelPadding * 2);
 
                 ctx.fillStyle = 'black';
@@ -2381,6 +2431,40 @@ const AnnotationPage = () => {
     }
     setIsLoading(false)
   }
+  
+  // Critical effects for stable annotation drawing
+  // Persist annotations to localStorage
+  useEffect(() => {
+    if (annotations.length > 0) {
+      localStorage.setItem('dental-annotations', JSON.stringify(annotations));
+      console.log('Annotations saved to localStorage:', annotations.length);
+    }
+  }, [annotations]);
+  
+  // Single, stable useEffect for annotation drawing - this is the ONLY place annotations should be drawn
+  useEffect(() => {
+    console.log('Drawing effect triggered:', { 
+      hasImage: !!image, 
+      hasCanvas: !!mainCanvasRef.current, 
+      annotationsCount: annotations.length,
+      isDrawingMode: isLiveWireTracingActive || isDrawingFreehand || isLineDrawingActive || isHybridDrawingActive
+    });
+    
+    if (image && mainCanvasRef.current) {
+      const ctx = mainCanvasRef.current.getContext('2d', { willReadFrequently: true });
+      
+      // Always clear and redraw the base image first
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      ctx.drawImage(image, 0, 0, image.width, image.height);
+      
+      // Draw annotations if we have any and we're not in an active drawing mode
+      if (annotations.length > 0 && !isLiveWireTracingActive && !isDrawingFreehand && !isLineDrawingActive && !isHybridDrawingActive) {
+        console.log('Drawing annotations:', annotations.length);
+        drawAnnotations(ctx, image, 0, 0, 1, selectedAnnotation, areaScale);
+      }
+    }
+  }, [annotations, image, selectedAnnotation, areaScale, showOriginalLabels, drawAnnotations]);
+  
   const DateFormatter = (date) => {
     return new Intl.DateTimeFormat('en-US', {
       month: 'short',
@@ -2616,13 +2700,13 @@ const AnnotationPage = () => {
                     }}>
                       <h5>
                         <Button id="btnPreVisit" type="button" color="secondary" onClick={handlePreviousClick} disabled={firstVisit}>
-                          <i class="fas fa-backward"></i>
+                          <i className="fas fa-backward"></i>
                           <UncontrolledTooltip placement="bottom" target="btnPreVisit">Show Previous Visit</UncontrolledTooltip>
                         </Button>&nbsp;
                         Xray Date : {DateFormatter(new Date(sessionManager.getItem('xrayDate')))}
                         &nbsp;
                         <Button id="btnNextVisit" type="button" color="secondary" disabled={lastVisit} onClick={handleNextClick}>
-                          <i class="fas fa-forward"></i>
+                          <i className="fas fa-forward"></i>
                           <UncontrolledTooltip placement="bottom" target="btnNextVisit">Show Next Visit</UncontrolledTooltip>
                         </Button>
                       </h5>
@@ -2766,16 +2850,16 @@ const AnnotationPage = () => {
                         height: '100%'
                       }}>
                         <h5 style={{ padding: 0 }}>
-                          <Button id="btnPreVisit" type="button" color="secondary" onClick={handlePreviousClick} disabled={firstVisit}>
-                            <i class="fas fa-backward"></i>
-                            <UncontrolledTooltip placement="bottom" target="btnPreVisit">Show Previous Visit</UncontrolledTooltip>
-                          </Button>&nbsp;
-                          Xray Date : {DateFormatter(new Date(sessionManager.getItem('xrayDate')))}
-                          &nbsp;
-                          <Button id="btnNextVisit" type="button" color="secondary" disabled={lastVisit} onClick={handleNextClick}>
-                            <i class="fas fa-forward"></i>
-                            <UncontrolledTooltip placement="bottom" target="btnNextVisit">Show Next Visit</UncontrolledTooltip>
-                          </Button>
+                                                  <Button id="btnPreVisit" type="button" color="secondary" onClick={handlePreviousClick} disabled={firstVisit}>
+                          <i className="fas fa-backward"></i>
+                          <UncontrolledTooltip placement="bottom" target="btnPreVisit">Show Previous Visit</UncontrolledTooltip>
+                        </Button>&nbsp;
+                        Xray Date : {DateFormatter(new Date(sessionManager.getItem('xrayDate')))}
+                        &nbsp;
+                        <Button id="btnNextVisit" type="button" color="secondary" disabled={lastVisit} onClick={handleNextClick}>
+                          <i className="fas fa-forward"></i>
+                          <UncontrolledTooltip placement="bottom" target="btnNextVisit">Show Previous Visit</UncontrolledTooltip>
+                        </Button>
                         </h5>
                       </Col>
                     </Row>}
@@ -2800,7 +2884,7 @@ const AnnotationPage = () => {
                     </Col>
                     <Col md={11}>
                       <FormGroup role="group" aria-label="First group" className="d-flex flex-row" style={{ padding: 0, justifyContent: 'center', alignItems: 'flex-start' }}>
-                        <Button id="btnScale" type="button" color="secondary"><i id="icnScale" class="fas fa-ruler"></i>
+                        <Button id="btnScale" type="button" color="secondary"><i id="icnScale" className="fas fa-ruler"></i>
                           <UncontrolledTooltip placement="bottom" target="btnScale">Scale: {areaScale}px to 1mm</UncontrolledTooltip>
                         </Button>
 
@@ -2816,7 +2900,7 @@ const AnnotationPage = () => {
                         <div className="slider-button-container">
                           <FormGroup role="group" className="slider-button d-flex flex-row" aria-label="second group" style={{ paddingTop: 0, background: 'none', marginBottom: 0, paddingBottom: 0 }}>
                             <Dropdown id="ddlZoom" isOpen={zoomDropdownOpen} toggle={() => { setZoomDropdownOpen(!zoomDropdownOpen) }}>
-                              <DropdownToggle id="btnZoom" type="button"><i class="fas fa-search"></i></DropdownToggle>
+                              <DropdownToggle id="btnZoom" type="button"><i className="fas fa-search"></i></DropdownToggle>
                               <DropdownMenu>
                                 {predefinedZooms.map(size => (
                                   <DropdownItem key={size} onClick={() => setZoom(size)}>
@@ -2972,13 +3056,13 @@ const AnnotationPage = () => {
                         </Popover>
 
                         <Button id="btnUndo" onClick={undo} disabled={currentStep <= 0}>
-                          <i id="icnScale" class="fas fa-undo"></i>
+                          <i id="icnScale" className="fas fa-undo"></i>
                         </Button>
                         <UncontrolledTooltip placement="bottom" target="btnUndo">Undo</UncontrolledTooltip>
                         <Button onClick={redo} id="btnRedo"
                           disabled={currentStep >= history.length - 1} style={{ marginRight: '5px' }}
                         >
-                          <i id="icnScale" class="fas fa-redo"></i>
+                          <i id="icnScale" className="fas fa-redo"></i>
                         </Button>
                         <Input
                           type="switch"
@@ -3021,7 +3105,7 @@ const AnnotationPage = () => {
                         )}
                         {selectedAnnotation && (
                           <Button onClick={handleEraserClick}>
-                            <i class="fa fa-eraser" aria-hidden={isEraserActive}></i>
+                            <i className="fa fa-eraser" aria-hidden={isEraserActive}></i>
                           </Button>
                         )}
                         {/* Eraser Size Controls */}
@@ -3556,6 +3640,9 @@ const AnnotationPage = () => {
           </ModalFooter>
         </Modal>
       </Card>
+      
+
+      
     </React.Fragment>
 
   )

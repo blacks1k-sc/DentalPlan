@@ -210,6 +210,47 @@ function getFileAsBase64(file) {
   });
 }
 
+// Helper function to find nearest tooth by centroid distance
+function findNearestToothByCentroid(anomaly, toothAnnotations) {
+  if (!anomaly.segmentation || anomaly.segmentation.length === 0) {
+    return null;
+  }
+
+  // Calculate anomaly centroid
+  const anomalyCentroid = {
+    x: anomaly.segmentation.reduce((sum, point) => sum + point.x, 0) / anomaly.segmentation.length,
+    y: anomaly.segmentation.reduce((sum, point) => sum + point.y, 0) / anomaly.segmentation.length
+  };
+
+  let nearestTooth = null;
+  let minDistance = Infinity;
+
+  for (const toothAnno of toothAnnotations) {
+    if (!toothAnno.segmentation || toothAnno.segmentation.length === 0) {
+      continue;
+    }
+
+    // Calculate tooth centroid
+    const toothCentroid = {
+      x: toothAnno.segmentation.reduce((sum, point) => sum + point.x, 0) / toothAnno.segmentation.length,
+      y: toothAnno.segmentation.reduce((sum, point) => sum + point.y, 0) / toothAnno.segmentation.length
+    };
+
+    // Calculate Euclidean distance
+    const distance = Math.sqrt(
+      Math.pow(anomalyCentroid.x - toothCentroid.x, 2) + 
+      Math.pow(anomalyCentroid.y - toothCentroid.y, 2)
+    );
+
+    if (distance < minDistance) {
+      minDistance = distance;
+      nearestTooth = Number.parseInt(toothAnno.label);
+    }
+  }
+
+  return nearestTooth;
+}
+
 // Function to add associatedTooth field to each annotation
 function addAssociatedToothToAnnotations(data) {
   console.log(data,data.annotations)
@@ -288,6 +329,14 @@ function addAssociatedToothToAnnotations(data) {
     if (!associatedTooth) {
       // Check overlap with each tooth for single tooth association
       let maxOverlap = 0;
+      let bestTooth = null;
+
+      // Determine overlap threshold based on anomaly type
+      let overlapThreshold = 0.5; // Default threshold for general anomalies
+      
+      if (anno.label && anno.label.toLowerCase().includes("periapical")) {
+        overlapThreshold = 0.05; // Much looser threshold for periapical lesions
+      }
 
       for (const toothAnno of toothAnnotations) {
         // Skip if either annotation doesn't have segmentation
@@ -301,14 +350,22 @@ function addAssociatedToothToAnnotations(data) {
           const annoArea = polygonArea(anno.segmentation.map(point => [point.x, point.y]));
           const overlapPercentage = annoArea > 0 ? overlap / annoArea : 0;
 
-          // Only consider if overlap is at least 80%
-          if (overlapPercentage >= 0.8 && overlap > maxOverlap) {
+          // Use dynamic threshold based on anomaly type
+          if (overlapPercentage >= overlapThreshold && overlap > maxOverlap) {
             maxOverlap = overlap;
-            associatedTooth = Number.parseInt(toothAnno.label);
+            bestTooth = Number.parseInt(toothAnno.label);
           }
         } catch (error) {
           console.error("Error calculating overlap:", error);
         }
+      }
+
+      // If we found a tooth above threshold, use it
+      if (bestTooth) {
+        associatedTooth = bestTooth;
+      } else {
+        // Fallback: find nearest tooth by centroid distance
+        associatedTooth = findNearestToothByCentroid(anno, toothAnnotations);
       }
     }
 

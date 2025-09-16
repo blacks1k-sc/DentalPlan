@@ -29,6 +29,23 @@ import DentalChart from "./DentalChart"
 import sessionManager from "utils/sessionManager"
 import AnnotationPrerequisitesModal from "./AnnotationPrerequisitesModal"
 import { parsePipeDelimitedTable } from '../../utils/tableParser';
+
+// Add the missing format_chat_history function
+const format_chat_history = (chat_history) => {
+  if (!chat_history || !Array.isArray(chat_history)) {
+    return "No previous conversation.";
+  }
+  
+  const formatted = [];
+  for (let i = 0; i < Math.min(chat_history.length, 5); i++) {
+    const [question, answer] = chat_history[i];
+    formatted.push(`Q${i + 1}: ${question}`);
+    formatted.push(`A${i + 1}: ${answer}`);
+  }
+  
+  return formatted.join('\n');
+};
+
 const AnnotationList = ({
   annotations,
   hiddenAnnotations,
@@ -384,9 +401,16 @@ const AnnotationList = ({
   const structureAnnotationsForRAG = (selectedAnomalyMap = {}) => {
     console.log("structureAnnotationsForRAG called with:", { selectedAnomalyMap, annotationsCount: annotations.length })
     const teethData = {}
+    const processedPairs = new Set() // For deduplication
 
     // Process all annotations to group by tooth
     annotations.forEach((anno) => {
+      // Add null check for anno.label
+      if (!anno.label) {
+        console.warn('Annotation missing label in structureAnnotationsForRAG:', anno);
+        return;
+      }
+      
       let toothNumber = null
 
       // Determine the tooth number
@@ -406,7 +430,7 @@ const AnnotationList = ({
       // Skip if no associated tooth found
       if (!toothNumber) return
 
-      // Handle tooth ranges (e.g., "11-14" for bone loss)
+      // Handle tooth ranges (e.g., "11-14" for bone loss) - EXPAND INCLUSIVELY
       let toothNumbers = []
       if (typeof toothNumber === "string" && toothNumber.includes("-")) {
         const [start, end] = toothNumber.split("-").map((num) => Number.parseInt(num))
@@ -418,10 +442,19 @@ const AnnotationList = ({
       }
 
       // Process each tooth number
-      toothNumbers.forEach((tNum, index) => {
-        if (!teethData[tNum]) {
-          teethData[tNum] = {
-            number: tNum,
+      toothNumbers.forEach((tNum) => {
+        const toothKey = tNum.toString() // Convert to string for Flask schema
+        const dedupeKey = `${toothKey}_${anno.label}` // Create deduplication key
+        
+        // Skip if we've already processed this (tooth, description) pair
+        if (processedPairs.has(dedupeKey)) {
+          return
+        }
+        processedPairs.add(dedupeKey)
+
+        if (!teethData[toothKey]) {
+          teethData[toothKey] = {
+            number: toothKey, // STRING format for Flask schema
             anomalies: [],
             procedures: [],
             foreign_objects: [],
@@ -441,24 +474,36 @@ const AnnotationList = ({
         const isSelectedInstance = selectedAnomalyMap[uniqueKey] !== undefined
         if (isSelectedInstance) {
           metadata = selectedAnomalyMap[uniqueKey].metadata
+        } else {
+          // For treatment plan generation, ensure all anomalies have basic metadata
+          // This ensures the table format will be triggered
+          metadata = {
+            confidence: anno.confidence || 0.8,
+            severity: "moderate",
+            location: "general",
+            description: anno.label,
+            timestamp: new Date().toISOString()
+          }
         }
 
+        // Create stable, short description for RAG
+        const stableDescription = getStableDescription(anno.label)
 
         const annotationData = {
-          description: anno.label,
+          description: stableDescription, // Use stable description
           metadata: metadata,
         }
 
         // Categorize based on the category from classCategories
         if (category === "Anomaly") {
-          teethData[tNum].anomalies.push(annotationData)
+          teethData[toothKey].anomalies.push(annotationData)
         } else if (category === "Procedure") {
-          teethData[tNum].procedures.push(annotationData)
+          teethData[toothKey].procedures.push(annotationData)
         } else if (category === "Foreign Object") {
-          teethData[tNum].foreign_objects.push(annotationData)
+          teethData[toothKey].foreign_objects.push(annotationData)
         } else {
           // Default to anomalies if category is unclear
-          teethData[tNum].anomalies.push(annotationData)
+          teethData[toothKey].anomalies.push(annotationData)
         }
       })
     })
@@ -466,7 +511,7 @@ const AnnotationList = ({
     // Convert to array format and clean up empty categories
     const teethArray = Object.values(teethData)
       .map((tooth) => {
-        const cleanTooth = { number: tooth.number }
+        const cleanTooth = { number: tooth.number } // Already string format
 
         if (tooth.anomalies.length > 0) {
           cleanTooth.anomalies = tooth.anomalies
@@ -485,8 +530,51 @@ const AnnotationList = ({
     const result = {
       teeth: teethArray
     }
+    
+    // Enhanced logging before return
+    const totalAnomalies = teethArray.reduce((sum, tooth) => sum + (tooth.anomalies?.length || 0), 0)
+    const distinctToothCount = teethArray.length
+    const sampleEntries = teethArray.slice(0, 3).map(tooth => ({
+      tooth: tooth.number,
+      anomalies: tooth.anomalies?.map(a => a.description) || []
+    }))
+    
+    console.log("CV→RAG Transform:", {
+      totalAnomalies,
+      distinctToothCount,
+      sampleEntries,
+      processedPairs: processedPairs.size
+    })
+    
     console.log("structureAnnotationsForRAG returning:", result)
     return result
+  }
+
+  // Helper function to create stable, short descriptions for RAG
+  const getStableDescription = (label) => {
+    const labelLower = label.toLowerCase()
+    
+    // Map to stable descriptions
+    if (labelLower.includes('bone loss')) return 'bone loss'
+    if (labelLower.includes('caries')) return 'caries'
+    if (labelLower.includes('impacted')) return 'impacted tooth'
+    if (labelLower.includes('filling')) return 'filling'
+    if (labelLower.includes('crown')) return 'crown'
+    if (labelLower.includes('root canal')) return 'root canal'
+    if (labelLower.includes('extraction')) return 'extraction'
+    if (labelLower.includes('implant')) return 'implant'
+    if (labelLower.includes('bridge')) return 'bridge'
+    if (labelLower.includes('periodontal')) return 'periodontal disease'
+    if (labelLower.includes('gingivitis')) return 'gingivitis'
+    if (labelLower.includes('abscess')) return 'abscess'
+    if (labelLower.includes('fracture')) return 'fracture'
+    if (labelLower.includes('crack')) return 'crack'
+    if (labelLower.includes('erosion')) return 'erosion'
+    if (labelLower.includes('attrition')) return 'attrition'
+    if (labelLower.includes('abrasion')) return 'abrasion'
+    
+    // Default: return original label (cleaned up)
+    return label.replace(/[\[\]]/g, '').trim()
   }
 
   // Helper function to compare segmentation arrays for exact match
@@ -577,83 +665,35 @@ const AnnotationList = ({
       
       console.log('Starting RAG job for CDT codes...');
       
-      // Use backend streaming endpoint (which forwards to Flask)
-      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
-        method: 'POST',
+      // Use CDT codes endpoint to get treatment codes
+      const response = await fetch('http://localhost:3000/getCDTCodes', {
+        method: 'GET',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${sessionManager.getItem("token")}`
-        },
-        body: JSON.stringify({
-          query: `create a treatment plan`,
-          json: structuredData,
-          patient_name: sessionStorage.getItem("patientId")
-        })
+        }
       });
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      // Create a reader for the streaming response
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let accumulatedText = '';
-
-      // Read the stream in real-time
-      while (true) {
-        const { done, value } = await reader.read();
-        
-        if (done) break;
-
-        // Decode the chunk and process it
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              
-              if (data.type === 'token') {
-                // Add new token to the accumulated text
-                accumulatedText += data.content;
-                
-                // Update UI in real-time (you can add a loading state here)
-                console.log('Streaming CDT response:', accumulatedText);
-                
-              } else if (data.type === 'done') {
-                // Streaming is complete
-                console.log('RAG response received:', accumulatedText);
-                
-                if (accumulatedText.trim()) {
-                  // Process the complete response
-                  const ragText = accumulatedText;
-                  
-                  if (ragText && typeof ragText === 'string') {
-                    // Parse CDT codes from the response
-                    return parseCdtCodes(ragText, convertedCdtCode, selectedAnomaly);
-                  } else {
-                    console.error('Invalid RAG response format:', ragText);
-                    setTreatmentPlanError(true);
-                    return [];
-                  }
-                } else {
-                  setTreatmentPlanError(true);
-                  return [];
-                }
-                
-              } else if (data.type === 'error') {
-                // Handle error
-                console.error('RAG streaming error:', data.content);
-                setTreatmentPlanError(true);
-                return [];
-              }
-            } catch (parseError) {
-              console.error('Error parsing SSE data:', parseError);
-            }
-          }
-        }
+      // Parse the JSON response from CDT codes endpoint
+      const result = await response.json();
+      const cdtCodes = result.cdtCodes || [];
+      
+      console.log('CDT codes received:', cdtCodes.length, 'codes');
+      
+      // Process CDT codes for the selected anomaly
+      if (cdtCodes.length > 0) {
+        // Convert CDT codes array to a format that parseCdtCodes can handle
+        const cdtCodesText = cdtCodes.map(code => 
+          `${code['Procedure Code'] || ''} - ${code['Description'] || ''}`
+        ).join('\n');
+        return parseCdtCodes(cdtCodesText, convertedCdtCode, selectedAnomaly);
+      } else {
+        console.warn('No CDT codes received');
+        return [];
       }
 
     } catch (error) {
@@ -1014,9 +1054,31 @@ const AnnotationList = ({
     setPrerequisitesModalOpen(false)
     setSelectedAnnotationForPrerequisites(null)
   }
+  // Track primed patient/visit combinations to avoid duplicates
+  const [primedSessions, setPrimedSessions] = useState(new Set());
+
   const sendInitialContextToLLM = async () => {
     try {
-      console.log('Sending initial context to LLM...');
+      // Get the same patientId and visitId that ChatPopup uses
+      const patientId = sessionManager.getItem('patientId');
+      const visitId = sessionManager.getItem('visitId');
+      
+      // Skip if missing required IDs
+      if (!patientId || !visitId) {
+        console.warn('CV→RAG Priming skipped: missing patientId or visitId', { patientId, visitId });
+        return;
+      }
+
+      // Create deduplication key
+      const sessionKey = `${patientId}_${visitId}`;
+      
+      // Skip if already primed for this session
+      if (primedSessions.has(sessionKey)) {
+        console.log('CV→RAG Priming skipped: already primed for', { patientId, visitId });
+        return;
+      }
+
+      console.log('CV→RAG Priming: uploading annotations for', { patientId, visitId });
       
       // Structure all annotations into the required format
       const selectedAnomalyMap = {}
@@ -1029,19 +1091,35 @@ const AnnotationList = ({
         }
       })
 
-      const structuredData = structureAnnotationsForRAG(selectedAnomalyMap)
+      const annotationData = structureAnnotationsForRAG(selectedAnomalyMap)
       
-      // Use backend streaming endpoint (which forwards to Flask)
-      const response = await fetch('http://localhost:3000/api/rag-chat-stream', {
+      // Log before upload with detailed info
+      const totalAnomalies = annotationData.teeth?.reduce((sum, tooth) => sum + (tooth.anomalies?.length || 0), 0) || 0
+      const distinctToothCount = annotationData.teeth?.length || 0
+      const sampleEntries = annotationData.teeth?.slice(0, 3).map(tooth => ({
+        tooth: tooth.number,
+        anomalies: tooth.anomalies?.map(a => a.description) || []
+      })) || []
+      
+      console.log('CV→RAG Priming: uploading annotations for', { 
+        patientId, 
+        visitId,
+        totalAnomalies,
+        distinctToothCount,
+        sampleEntries
+      });
+      
+      // Call Node.js backend which forwards to Flask
+      const response = await fetch('http://localhost:3000/api/xray-upload', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${sessionManager.getItem("token")}`
         },
         body: JSON.stringify({
-          query: `analyze these dental annotations and provide insights`,
-          json: structuredData,
-          patient_name: sessionStorage.getItem("patientId")
+          patientId: patientId,
+          visitId: visitId,
+          annotationData: annotationData
         })
       });
 
@@ -1049,65 +1127,24 @@ const AnnotationList = ({
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      // Create a reader for the streaming response
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let accumulatedText = '';
+      const result = await response.json();
+      
+      // Log success with Flask response fields (EXACT reference structure)
+      console.log('CV→RAG Priming success:', {
+        patientId,
+        visitId,
+        annotationsFound: result.annotationsFound,
+        status: result.status
+      });
 
-      // Read the stream in real-time
-      while (true) {
-        const { done, value } = await reader.read();
-        
-        if (done) break;
-
-        // Decode the chunk and process it
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              
-              if (data.type === 'token') {
-                // Add new token to the accumulated text
-                accumulatedText += data.content;
-                
-                // Update UI in real-time
-                console.log('Streaming initial context response:', accumulatedText);
-                
-              } else if (data.type === 'done') {
-                // Streaming is complete
-                console.log('Initial context RAG response:', accumulatedText);
-                
-                if (accumulatedText.trim()) {
-                  // Process the complete response
-                  const ragText = accumulatedText;
-                  
-                  if (ragText && typeof ragText === 'string') {
-                    // Handle the initial context response
-                    console.log('Initial context processed successfully');
-                    // You can add logic here to handle the initial context
-                  } else {
-                    console.error('Invalid initial context response format:', ragText);
-                  }
-                }
-                break;
-                
-              } else if (data.type === 'error') {
-                // Handle error
-                console.error('Initial context RAG streaming error:', data.content);
-                break;
-              }
-            } catch (parseError) {
-              console.error('Error parsing SSE data:', parseError);
-            }
-          }
-        }
-      }
+      // Mark this session as primed
+      setPrimedSessions(prev => new Set([...prev, sessionKey]));
 
     } catch (error) {
-      console.error('Error sending initial context to LLM:', error);
+      // Log concise error with patient/visit info
+      const patientId = sessionManager.getItem('patientId');
+      const visitId = sessionManager.getItem('visitId');
+      console.error('CV→RAG Priming failed:', { patientId, visitId, error: error.message });
     }
   };
   useEffect(() => {
@@ -1310,6 +1347,11 @@ const AnnotationList = ({
       const hiddenAnnotationsList = [...hiddenAnnotations]
 
       annotations.forEach((anno, index) => {
+        // Add null check for anno.label
+        if (!anno.label) {
+          console.warn('Annotation missing label:', anno);
+          return;
+        }
         const category = classCategories[anno.label.toLowerCase()]
         console.log(category, anno.label.toLowerCase())
         // Get the image group from the annotation's image

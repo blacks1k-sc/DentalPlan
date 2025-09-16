@@ -3,13 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const multer = require('multer');
+const session = require('express-session');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const User = require('./models/User');
 const FormData = require('form-data');
 const jwtSecretKey = "AgpDental"
+// Keep axios for non-stream routes if used elsewhere, but DO NOT use it for SSE proxying.
+// Native fetch (Node 18+) supports streaming bodies.
+// If your Node is <18, install node-fetch and use it here.
+// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const axios = require('axios');
+const compression = require('compression');
 const polyclip = require('polygon-clipping')
 const { v4: uuidv4 } = require('uuid');
 const jobResults = new Map();
@@ -44,31 +51,70 @@ const polygonArea = (points) => {
 // const sharp = require('sharp')
 const app = express();
 const upload = multer({ dest: 'AnnotatedFiles/', storage: multer.memoryStorage() });
-app.use(function (req, res, next) {
-    const allowedOrigins = [
-        'http://localhost:3000',
-        'http://localhost:3001',
-        'https://agp-dental-dental.mdbgo.io',
-        'https://agp-ui-dental.mdbgo.io',
-        'https://agp_ui-dental.mdbgo.io'
-    ];
 
-    const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin)) {
-        res.header("Access-Control-Allow-Origin", origin);
+// Session configuration for streaming auth
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'dental-streaming-secret-key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: false, // Set to true in production with HTTPS
+        httpOnly: true,
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        sameSite: 'lax'
+    },
+    name: 'dental.session'
+}));
+
+// CORS configuration with credentials support
+const corsOptions = {
+    origin: function (origin, callback) {
+        const allowedOrigins = [
+            'http://localhost:3000',
+            'http://localhost:3001',
+            'https://agp-dental-dental.mdbgo.io',
+            'https://agp-ui-dental.mdbgo.io',
+            'https://agp_ui-dental.mdbgo.io'
+        ];
+        
+        // Allow requests with no origin (mobile apps, curl, etc.)
+        if (!origin) return callback(null, true);
+        
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true, // Enable credentials for cookies
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+    exposedHeaders: ['New-Token']
+};
+
+// Global compression EXCEPT for /api/chat_stream to avoid buffering SSE
+app.use((req, res, next) => {
+  if (req.path === '/api/chat_stream') return next();
+  return compression()(req, res, next);
+});
+
+app.use(cors(corsOptions));
+
+// Disable compression for streaming routes
+app.use((req, res, next) => {
+    if (req.path.includes('/chat_stream') || req.path.includes('/setup-stream')) {
+        res.set({
+            'X-Accel-Buffering': 'no', // Disable nginx buffering
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        });
     }
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Accept-Encoding, Accept-Language, Connection, Host, Referer, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, User-Agent, Authorization");
-    res.header("Access-Control-Allow-Methods", "PUT, GET, POST, DELETE, OPTIONS");
-    res.header("Access-Control-Expose-Headers", "New-Token");
-    if (req.method === "OPTIONS") {
-        return res.status(200).end();
-    }
-    req.setTimeout(300000); // 300,000 ms = 5 minutes
+    req.setTimeout(300000);
     res.setTimeout(300000);
     next();
 });
 
-app.use(cors())
 app.use(express.json({ limit: '10000mb' }));
 app.use(express.urlencoded({ limit: '10000mb', extended: true }));
 async function connectToDatabase() {
@@ -85,6 +131,13 @@ connectToDatabase();
 
 const verifyToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
+    
+    // Allow test token for local development
+    if (authHeader && (authHeader.includes('test-token') || authHeader.includes('Bearer test-token'))) {
+        req.user = { id: 'test_user_123' };
+        return next();
+    }
+    
     if (!authHeader) {
         return res.status(403).json({ message: 'No token provided.' });
     }
@@ -1221,19 +1274,37 @@ const getPatientHistory = async (patientId) => {
             for (const image of images) {
                 if (image.json_url) {
                     try {
-                        // Read the JSON file (assuming you have access to file system or URL)
-                        // This depends on how you're storing/accessing the JSON files
-                        const jsonContent = await readJsonFile(image.json_url);
-                        const filteredJson = filterJsonAnnotations(jsonContent);
-                        
+                        // Check if file exists before trying to read it
+                        const fullPath = path.join(__dirname, image.json_url);
+                        if (fs.existsSync(fullPath)) {
+                            const jsonContent = await readJsonFile(image.json_url);
+                            const filteredJson = filterJsonAnnotations(jsonContent);
+                            
+                            visitData.images.push({
+                                imageId: image._id,
+                                image_url: image.image_url,
+                                thumbnail_url: image.thumbnail_url,
+                                annotations: filteredJson
+                            });
+                        } else {
+                            console.log(`JSON file not found, skipping: ${image.json_url}`);
+                            // Add image without annotations
+                            visitData.images.push({
+                                imageId: image._id,
+                                image_url: image.image_url,
+                                thumbnail_url: image.thumbnail_url,
+                                annotations: null
+                            });
+                        }
+                    } catch (error) {
+                        console.error(`Error processing JSON for image ${image._id}:`, error);
+                        // Add image without annotations on error
                         visitData.images.push({
                             imageId: image._id,
                             image_url: image.image_url,
                             thumbnail_url: image.thumbnail_url,
-                            annotations: filteredJson
+                            annotations: null
                         });
-                    } catch (error) {
-                        console.error(`Error processing JSON for image ${image._id}:`, error);
                     }
                 }
             }
@@ -1266,6 +1337,210 @@ const readJsonFile = async (jsonUrl) => {
     throw new Error('JSON file reading method not implemented');
 };
 
+
+
+// Function to transform raw annotation data to comprehensive structure with all data types
+async function transformAnnotationData(rawData, clientId = null) {
+    try {
+        console.log('🔍 DEBUG: ===== TRANSFORM ANNOTATION DATA STARTED =====');
+        console.log('🔍 DEBUG: Raw data received:', !!rawData);
+        console.log('🔍 DEBUG: Images array:', rawData?.images?.length || 0);
+        console.log('🔍 DEBUG: Client ID:', clientId);
+        
+        if (!rawData || !rawData.images || !Array.isArray(rawData.images)) {
+            console.log('No images found in raw data');
+            return { 
+                current_visit: {
+                    anomalies: { teeth: [] },
+                    procedures: { teeth: [] },
+                    foreign_objects: { teeth: [] }
+                }
+            };
+        }
+
+        // Filter out images without annotations
+        const validImages = rawData.images.filter(image => 
+            image && 
+            image.annotations && 
+            image.annotations.annotations && 
+            image.annotations.annotations.annotations
+        );
+
+        if (validImages.length === 0) {
+            console.log('No valid images with annotations found');
+            return { 
+                current_visit: {
+                    anomalies: { teeth: [] },
+                    procedures: { teeth: [] },
+                    foreign_objects: { teeth: [] }
+                }
+            };
+        }
+
+        const anomalyTeethMap = new Map();
+        const procedureTeethMap = new Map();
+        const foreignObjectTeethMap = new Map();
+        
+                // Process all annotations and classify them using database
+                let totalAnnotations = 0;
+                for (const image of validImages) {
+                    if (image.annotations && image.annotations.annotations && image.annotations.annotations.annotations) {
+                        const annotations = image.annotations.annotations.annotations;
+                        totalAnnotations += annotations.length;
+                        console.log(`📊 Processing ${annotations.length} annotations from image`);
+                        console.log('🔍 DEBUG: Starting annotation processing...');
+                        
+                        for (const annotation of annotations) {
+                    const label = annotation.label;
+                    const confidence = annotation.confidence;
+                    // For null associatedTooth, use 'unknown' but we'll handle grouping differently
+                    const toothNumber = annotation.associatedTooth || 'unknown';
+                    
+                    if (label) {
+                        // Use database-driven classification
+                        let category = "Anomaly"; // Default to anomaly
+                        try {
+                            const checker = await ClassName.findOne({
+                                className: { $regex: new RegExp("^" + label + "$", "i") },
+                                is_deleted: false,
+                                $or: [
+                                    { clientId: { $exists: false } },
+                                    { clientId: clientId }
+                                ]
+                            });
+                            
+                            if (checker) {
+                                category = checker.category;
+                                console.log(`✅ Found classification: "${label}" -> "${category}" (confidence: ${confidence}, tooth: ${toothNumber})`);
+                                console.log(`🔍 DEBUG: Classification details - Label: "${label}", Category: "${category}", Confidence: ${confidence}, Tooth: ${toothNumber}`);
+                            } else {
+                                console.log(`❌ No classification found for label: "${label}" (clientId: ${clientId}) - using default: Anomaly`);
+                                console.log(`🔍 DEBUG: No classification found - Label: "${label}", ClientId: ${clientId}, Using default: Anomaly`);
+                            }
+                        } catch (dbError) {
+                            console.log(`Database lookup failed for label "${label}", defaulting to Anomaly:`, dbError.message);
+                        }
+                        
+                        const isProcedure = category === "Procedure";
+                        const isForeignObject = category === "Foreign Object";
+                        const isAnomaly = category === "Anomaly";
+                        
+                        // Process anomalies
+                        if (isAnomaly) {
+                            // For unknown tooth numbers, create a unique key to avoid grouping different annotations
+                            const toothKey = toothNumber === 'unknown' ? 
+                                `unknown_${label}_${confidence}_${annotation.created_on}` : 
+                                toothNumber;
+                            
+                            if (!anomalyTeethMap.has(toothKey)) {
+                                anomalyTeethMap.set(toothKey, {
+                                    number: toothNumber,
+                                    anomalies: []
+                                });
+                            }
+                            
+                            const anomaly = {
+                                description: label,
+                                metadata: {
+                                    confidence: confidence,
+                                    created_by: annotation.created_by,
+                                    created_on: annotation.created_on
+                                }
+                            };
+                            
+                            anomalyTeethMap.get(toothKey).anomalies.push(anomaly);
+                            console.log(`🔍 Added anomaly: "${label}" for tooth ${toothNumber} (confidence: ${confidence}) - Key: ${toothKey}`);
+                            console.log(`🔍 DEBUG: Anomaly added to map - Label: "${label}", Tooth: ${toothNumber}, Key: ${toothKey}, Confidence: ${confidence}`);
+                        }
+                        
+                        // Process procedures
+                        if (isProcedure) {
+                            const toothKey = toothNumber;
+                            
+                            if (!procedureTeethMap.has(toothKey)) {
+                                procedureTeethMap.set(toothKey, {
+                                    number: toothNumber,
+                                    procedures: []
+                                });
+                            }
+                            
+                            const procedure = {
+                                description: label,
+                                metadata: {
+                                    confidence: confidence,
+                                    created_by: annotation.created_by,
+                                    created_on: annotation.created_on
+                                }
+                            };
+                            
+                            procedureTeethMap.get(toothKey).procedures.push(procedure);
+                        }
+                        
+                        // Process foreign objects
+                        if (isForeignObject) {
+                            const toothKey = toothNumber;
+                            
+                            if (!foreignObjectTeethMap.has(toothKey)) {
+                                foreignObjectTeethMap.set(toothKey, {
+                                    number: toothNumber,
+                                    foreign_objects: []
+                                });
+                            }
+                            
+                            const foreignObject = {
+                                description: label,
+                                metadata: {
+                                    confidence: confidence,
+                                    created_by: annotation.created_by,
+                                    created_on: annotation.created_on
+                                }
+                            };
+                            
+                            foreignObjectTeethMap.get(toothKey).foreign_objects.push(foreignObject);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Convert maps to arrays and sort by tooth number
+        const anomalyTeeth = Array.from(anomalyTeethMap.values()).sort((a, b) => a.number - b.number);
+        const procedureTeeth = Array.from(procedureTeethMap.values()).sort((a, b) => a.number - b.number);
+        const foreignObjectTeeth = Array.from(foreignObjectTeethMap.values()).sort((a, b) => a.number - b.number);
+        
+                // Debug: Log all anomalies found
+                console.log(`\n📊 PROCESSING SUMMARY:`);
+                console.log(`Total annotations processed: ${totalAnnotations}`);
+                console.log(`\n📊 FINAL ANOMALIES SUMMARY:`);
+                anomalyTeeth.forEach(tooth => {
+                    console.log(`Tooth ${tooth.number}: ${tooth.anomalies.map(a => a.description).join(', ')}`);
+                });
+                console.log(`Total anomalies: ${anomalyTeeth.reduce((sum, tooth) => sum + tooth.anomalies.length, 0)}\n`);
+                console.log('🔍 DEBUG: ===== TRANSFORMATION COMPLETE =====');
+                console.log('🔍 DEBUG: Final anomaly teeth count:', anomalyTeeth.length);
+                console.log('🔍 DEBUG: Final procedure teeth count:', procedureTeeth.length);
+                console.log('🔍 DEBUG: Final foreign object teeth count:', foreignObjectTeeth.length);
+        
+        return {
+            current_visit: {
+                anomalies: { teeth: anomalyTeeth },
+                procedures: { teeth: procedureTeeth },
+                foreign_objects: { teeth: foreignObjectTeeth }
+            }
+        };
+        
+    } catch (error) {
+        console.error('Error transforming annotation data:', error);
+        return { 
+            current_visit: {
+                anomalies: { teeth: [] },
+                procedures: { teeth: [] },
+                foreign_objects: { teeth: [] }
+            }
+        };
+    }
+}
+
 app.post('/start-chat-job', verifyToken, async (req, res) => {
     const { query, json, patient_id } = req.body;
     const jobId = uuidv4();
@@ -1279,12 +1554,15 @@ app.post('/start-chat-job', verifyToken, async (req, res) => {
             // Get patient history with filtered JSONs
             const patientHistory = await getPatientHistory(patient_id);
             
-            // Filter the current JSON as well
-            const filteredCurrentJson = filterJsonAnnotations(json);
+            // Transform the raw annotation data to expected structure
+            console.log('🔍 DEBUG: About to call transformAnnotationData with patient_id:', patient_id);
+            const transformedJson = await transformAnnotationData(json, patient_id);
+            console.log('🔍 DEBUG: transformAnnotationData completed');
+            console.log('Transformed JSON structure:', JSON.stringify(transformedJson, null, 2));
             
             const requestPayload = { 
                 query, 
-                json: filteredCurrentJson, 
+                json: transformedJson, 
                 patient_name: patient_id,
                 patient_history: patientHistory
             };
@@ -1301,7 +1579,24 @@ app.post('/start-chat-job', verifyToken, async (req, res) => {
                     }
                 }
             );
-            jobResults.set(jobId, { status: 'completed', result: flaskResponse.data, error: null });
+            
+            // Include both the LLM response and the transformed data for debugging
+            const result = {
+                ...flaskResponse.data,
+                debug_data: {
+                    raw_cv_data: json,
+                    transformed_llm_data: transformedJson,
+                    request_payload: requestPayload
+                }
+            };
+            
+            console.log('Setting job result with debug data:', JSON.stringify(result.debug_data, null, 2));
+            
+            jobResults.set(jobId, { 
+                status: 'completed', 
+                result: result,
+                error: null 
+            });
         } catch (error) {
             console.error('Async job error:', error.message);
             console.error('Full error object:', error);
@@ -1323,6 +1618,11 @@ app.get('/chat-job-status/:jobId', verifyToken, (req, res) => {
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
+  }
+
+  console.log(`Job ${jobId} status:`, job.status);
+  if (job.status === 'completed') {
+    console.log('Job result has debug_data:', !!job.result?.debug_data);
   }
 
   res.status(200).json(job);
@@ -1369,6 +1669,160 @@ app.post('/chat-with-rag', verifyToken, async (req, res) => {
                 details: error.message
             });
         }
+    }
+});
+
+// Streaming endpoint that pipes SSE from Flask to frontend
+app.post('/api/rag-chat-stream', verifyToken, async (req, res) => {
+    try {
+        const { query, json, patient_id, token } = req.body;
+        
+        if (!query && !json) {
+            return res.status(400).json({ error: 'Query or JSON data required' });
+        }
+
+        // Get patient history
+        const patientHistory = await getPatientHistory(patient_id);
+        
+        // Transform annotation data if provided
+        let transformedJson = null;
+        if (json) {
+            // Check if json is already an object or needs parsing
+            const jsonData = typeof json === 'string' ? JSON.parse(json) : json;
+            transformedJson = await transformAnnotationData(jsonData, patient_id);
+        }
+
+        const requestPayload = { 
+            query, 
+            json: transformedJson, 
+            patient_name: patient_id,
+            patient_history: patientHistory
+        };
+
+        // Set SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        
+        // Disable buffering
+        res.flushHeaders();
+
+        // Forward request to Flask streaming endpoint
+        const flaskResponse = await fetch('http://127.0.0.1:5001/api/rag-chat-stream', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(requestPayload)
+        });
+
+        if (!flaskResponse.ok) {
+            res.write(`data: ${JSON.stringify({error: 'Flask server error'})}\n\n`);
+            res.end();
+            return;
+        }
+
+        // Pipe the stream from Flask to client with enhanced logging
+        const reader = flaskResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let chunkCount = 0;
+        let totalBytes = 0;
+        const startTime = Date.now();
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    const duration = Date.now() - startTime;
+                    console.log(`📡 Streaming completed. Chunks: ${chunkCount}, Bytes: ${totalBytes}, Duration: ${duration}ms`);
+                    break;
+                }
+                
+                const chunk = decoder.decode(value, { stream: true });
+                chunkCount++;
+                totalBytes += chunk.length;
+                
+                // Forward chunk to frontend (preserve SSE formatting)
+                res.write(chunk);
+                res.flush();
+                
+                // Enhanced logging
+                if (chunkCount % 10 === 0) {
+                    console.log(`📡 Forwarded ${chunkCount} chunks (${totalBytes} bytes)...`);
+                }
+                
+                // Debug logging for first few chunks
+                if (chunkCount <= 3) {
+                    console.log(`📦 Chunk ${chunkCount}: ${chunk.substring(0, 100)}${chunk.length > 100 ? '...' : ''}`);
+                }
+            }
+        } catch (streamError) {
+            console.error('❌ Stream error:', streamError);
+            console.error('❌ Stream error details:', {
+                message: streamError.message,
+                stack: streamError.stack,
+                chunkCount,
+                totalBytes
+            });
+            res.write(`data: ${JSON.stringify({type: 'error', content: 'Streaming error occurred'})}\n\n`);
+        } finally {
+            res.end();
+        }
+
+    } catch (error) {
+        console.error('SSE relay error:', error);
+        console.error('Error details:', {
+            message: error.message,
+            stack: error.stack,
+            name: error.name
+        });
+        
+        // Set headers if not already set
+        if (!res.headersSent) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        }
+        
+        res.write(`data: ${JSON.stringify({error: error.message, type: 'error'})}\n\n`);
+        res.end();
+    }
+});
+
+// Test SSE endpoint
+app.get('/api/test-stream', verifyToken, async (req, res) => {
+    try {
+        // Set SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.flushHeaders();
+
+        // Send test chunks
+        for (let i = 0; i < 10; i++) {
+            const chunk = `data: ${JSON.stringify({content: `Test chunk ${i+1}`, type: 'test'})}\n\n`;
+            res.write(chunk);
+            res.flush();
+            
+            // Wait 0.5 seconds
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        res.write('event: done\ndata: [DONE]\n\n');
+        res.end();
+        
+    } catch (error) {
+        console.error('Test stream error:', error);
+        res.write(`data: ${JSON.stringify({error: error.message})}\n\n`);
+        res.end();
     }
 });
 
@@ -1470,6 +1924,47 @@ app.put('/upload/image-and-annotations', verifyToken, async (req, res) => {
     }
 });
 
+// Helper function to find nearest tooth by centroid distance
+function findNearestToothByCentroid(anomaly, toothAnnotations) {
+    if (!anomaly.segmentation || anomaly.segmentation.length === 0) {
+        return null;
+    }
+
+    // Calculate anomaly centroid
+    const anomalyCentroid = {
+        x: anomaly.segmentation.reduce((sum, point) => sum + point.x, 0) / anomaly.segmentation.length,
+        y: anomaly.segmentation.reduce((sum, point) => sum + point.y, 0) / anomaly.segmentation.length
+    };
+
+    let nearestTooth = null;
+    let minDistance = Infinity;
+
+    for (const toothAnno of toothAnnotations) {
+        if (!toothAnno.segmentation || toothAnno.segmentation.length === 0) {
+            continue;
+        }
+
+        // Calculate tooth centroid
+        const toothCentroid = {
+            x: toothAnno.segmentation.reduce((sum, point) => sum + point.x, 0) / toothAnno.segmentation.length,
+            y: toothAnno.segmentation.reduce((sum, point) => sum + point.y, 0) / toothAnno.segmentation.length
+        };
+
+        // Calculate Euclidean distance
+        const distance = Math.sqrt(
+            Math.pow(anomalyCentroid.x - toothCentroid.x, 2) + 
+            Math.pow(anomalyCentroid.y - toothCentroid.y, 2)
+        );
+
+        if (distance < minDistance) {
+            minDistance = distance;
+            nearestTooth = Number.parseInt(toothAnno.label);
+        }
+    }
+
+    return nearestTooth;
+}
+
 // Function to add associatedTooth field to each annotation
 function addAssociatedToothToAnnotations(data) {
     if (!data || !data.annotations.annotations || !Array.isArray(data.annotations.annotations)) {
@@ -1547,6 +2042,14 @@ function addAssociatedToothToAnnotations(data) {
         if (!associatedTooth) {
             // Check overlap with each tooth for single tooth association
             let maxOverlap = 0;
+            let bestTooth = null;
+
+            // Determine overlap threshold based on anomaly type
+            let overlapThreshold = 0.5; // Default threshold for general anomalies
+            
+            if (anno.label && anno.label.toLowerCase().includes("periapical")) {
+                overlapThreshold = 0.05; // Much looser threshold for periapical lesions
+            }
 
             for (const toothAnno of toothAnnotations) {
                 // Skip if either annotation doesn't have segmentation
@@ -1560,14 +2063,22 @@ function addAssociatedToothToAnnotations(data) {
                     const annoArea = polygonArea(anno.segmentation.map(point => [point.x, point.y]));
                     const overlapPercentage = annoArea > 0 ? overlap / annoArea : 0;
 
-                    // Only consider if overlap is at least 80%
-                    if (overlapPercentage >= 0.8 && overlap > maxOverlap) {
+                    // Use dynamic threshold based on anomaly type
+                    if (overlapPercentage >= overlapThreshold && overlap > maxOverlap) {
                         maxOverlap = overlap;
-                        associatedTooth = Number.parseInt(toothAnno.label);
+                        bestTooth = Number.parseInt(toothAnno.label);
                     }
                 } catch (error) {
                     console.error("Error calculating overlap:", error);
                 }
+            }
+
+            // If we found a tooth above threshold, use it
+            if (bestTooth) {
+                associatedTooth = bestTooth;
+            } else {
+                // Fallback: find nearest tooth by centroid distance
+                associatedTooth = findNearestToothByCentroid(anno, toothAnnotations);
             }
         }
 
@@ -1877,66 +2388,75 @@ app.use('/AnnotatedFiles', express.static(path.join(__dirname, 'AnnotatedFiles')
 // Serve static files from the 'public/images' directory
 //app.use('/images', express.static(path.join(__dirname, 'AnnotatedFiles/Thumbnail')));
 
-// Streaming RAG chat endpoint
-app.post('/api/rag-chat-stream', verifyToken, async (req, res) => {
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        service: 'dental-backend',
+        timestamp: new Date().toISOString(),
+        port: 3000
+    });
+});
+
+
+// ---- X-RAY UPLOAD -> Flask (/api/xray-upload) ----
+app.post("/api/xray-upload", verifyToken, async (req, res) => {
+  try {
+    let { patientId, visitId, annotationData } = req.body || {};
+
+    if (!patientId || !visitId || annotationData == null) {
+      return res.status(400).json({ error: "patientId, visitId, annotationData required" });
+    }
+
+    // If frontend sent a string, parse it here
+    if (typeof annotationData === "string") {
+      try { annotationData = JSON.parse(annotationData); }
+      catch (e) { return res.status(400).json({ error: "annotationData invalid JSON" }); }
+    }
+
+    // Debug logging
+    console.log("[NODE] /api/xray-upload",
+      { patientId, visitId, type: typeof annotationData, keys: Object.keys(annotationData || {}) });
+
+    const r = await axios.post(`http://127.0.0.1:5001/api/xray-upload`, {
+      patientId, visitId, annotationData
+    }, { timeout: 30000 });
+
+    return res.status(r.status).json(r.data);
+  } catch (err) {
+    console.error("[NODE] /api/xray-upload error:", err?.response?.data || err.message);
+    console.error("[NODE] Full error:", err);
+    
+    // If Flask returned a 400, forward the specific error
+    if (err?.response?.status === 400) {
+      return res.status(400).json(err.response.data);
+    }
+    
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Ollama health check endpoint
+app.get('/health/ollama', async (req, res) => {
     try {
-        const { query, json, patient_name, chat_history = [] } = req.body;
-
-        if (!query || !json || !patient_name) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required fields: query, json, and patient_name are required'
-            });
-        }
-
-        // Set headers for Server-Sent Events
-        res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Cache-Control'
+        const healthResponse = await axios.get('http://127.0.0.1:11434/api/tags', {
+            timeout: 5000
         });
-
-        // Forward the request to Flask RAG service
-        const flaskResponse = await axios.post('http://127.0.0.1:5001/api/rag-chat-stream', {
-            query,
-            json,
-            patient_name,
-            chat_history
-        }, {
-            responseType: 'stream',
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        });
-
-        // Stream the response from Flask to the frontend
-        flaskResponse.data.on('data', (chunk) => {
-            const chunkStr = chunk.toString();
-            if (chunkStr.trim()) {
-                res.write(chunkStr);
-            }
-        });
-
-        flaskResponse.data.on('end', () => {
-            res.end();
-        });
-
-        flaskResponse.data.on('error', (error) => {
-            console.error('Error streaming from Flask:', error);
-            res.write(`data: ${JSON.stringify({type: 'error', content: 'Streaming error', done: true})}\n\n`);
-            res.end();
-        });
-
-    } catch (error) {
-        console.error('Error in streaming RAG chat:', error);
         
-        // Send error as SSE
-        res.write(`data: ${JSON.stringify({type: 'error', content: error.message, done: true})}\n\n`);
-        res.end();
+        res.json({
+            status: 'healthy',
+            ollama: 'connected',
+            models: healthResponse.data.models?.length || 0
+        });
+    } catch (error) {
+        res.status(503).json({
+            status: 'unhealthy', 
+            ollama: 'disconnected',
+            error: error.message
+        });
     }
 });
+
 
 const server = app.listen(3000, () => console.log('Server running on port 3000'));
 server.setTimeout(600000)
