@@ -1,4 +1,4 @@
-/Users/nrup/DentalPlan/Dental-Rag-Flask-main/ollama_embedder.py:7: LangChainDeprecationWarning: Importing FAISS from langchain.vectorstores is deprecated. Please replace deprecated imports:
+/Users/nrup/DentalPlan copy 2/Dental-Rag-Flask-main/ollama_embedder.py:7: LangChainDeprecationWarning: Importing FAISS from langchain.vectorstores is deprecated. Please replace deprecated imports:
 
 >> from langchain.vectorstores import FAISS
 
@@ -7,9 +7,9 @@ with new imports of:
 >> from langchain_community.vectorstores import FAISS
 You can use the langchain cli to **automatically** upgrade many imports. Please see documentation here <https://python.langchain.com/docs/versions/v0_2/>
   from langchain.vectorstores import FAISS
-/Users/nrup/DentalPlan/Dental-Rag-Flask-main/claude_try.py:13: LangChainDeprecationWarning: The class `Ollama` was deprecated in LangChain 0.3.1 and will be removed in 1.0.0. An updated version of the class exists in the :class:`~langchain-ollama package and should be used instead. To use it run `pip install -U :class:`~langchain-ollama` and import as `from :class:`~langchain_ollama import OllamaLLM``.
+/Users/nrup/DentalPlan copy 2/Dental-Rag-Flask-main/claude_try.py:13: LangChainDeprecationWarning: The class `Ollama` was deprecated in LangChain 0.3.1 and will be removed in 1.0.0. An updated version of the class exists in the :class:`~langchain-ollama package and should be used instead. To use it run `pip install -U :class:`~langchain-ollama` and import as `from :class:`~langchain_ollama import OllamaLLM``.
   llm = Ollama(model="mistral:latest")
-/Users/nrup/DentalPlan/Dental-Rag-Flask-main/ollama_embedder.py:38: LangChainDeprecationWarning: The class `OllamaEmbeddings` was deprecated in LangChain 0.3.1 and will be removed in 1.0.0. An updated version of the class exists in the :class:`~langchain-ollama package and should be used instead. To use it run `pip install -U :class:`~langchain-ollama` and import as `from :class:`~langchain_ollama import OllamaEmbeddings``.
+/Users/nrup/DentalPlan copy 2/Dental-Rag-Flask-main/ollama_embedder.py:38: LangChainDeprecationWarning: The class `OllamaEmbeddings` was deprecated in LangChain 0.3.1 and will be removed in 1.0.0. An updated version of the class exists in the :class:`~langchain-ollama package and should be used instead. To use it run `pip install -U :class:`~langchain-ollama` and import as `from :class:`~langchain_ollama import OllamaEmbeddings``.
   self.embedding = OllamaEmbeddings(model=model_name)
 ✅ (Ollama) model loaded.
 Loading FAISS index from faiss_cdt.index...
@@ -18,20 +18,5 @@ Loading FAISS index from faiss_cdt.index...
 [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
  * Running on all addresses (0.0.0.0)
  * Running on http://127.0.0.1:5001
- * Running on http://10.0.0.147:5001
+ * Running on http://172.20.10.12:5001
 [33mPress CTRL+C to quit[0m
-127.0.0.1 - - [26/Aug/2025 22:04:36] "GET /health HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:04:40] "GET /api/test-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:05:31] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:06:15] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:10:47] "GET /health HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:28:18] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 22:45:56] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:23:40] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:24:58] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:26:41] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:27:01] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:27:13] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:35:36] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:35:51] "POST /api/rag-chat-stream HTTP/1.1" 200 -
-127.0.0.1 - - [26/Aug/2025 23:36:14] "POST /api/rag-chat-stream HTTP/1.1" 200 -

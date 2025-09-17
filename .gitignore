@@ -1,7 +1,6 @@
 # Dependencies
 node_modules/
 */node_modules/
-**/node_modules/
 
 # Build outputs
 build/
@@ -13,12 +12,6 @@ dist/
 *.log
 logs/
 */logs/
-**/*.log
-backend.log
-frontend.log
-flask.log
-backend_rag_streaming.log
-frontend_rag_streaming.log
 
 # Environment variables
 .env
@@ -27,146 +20,35 @@ frontend_rag_streaming.log
 .env.test.local
 .env.production.local
 
-# IDE and editor files
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# OS generated files
+# OS files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
 env/
 venv/
-ENV/
-env.bak/
-venv.bak/
-*.egg-info/
-.pytest_cache/
-**/__pycache__/
-
-# Flask
-instance/
-.webassets-cache
+.venv/
+dental-ai-env/
 
 # Database
 *.db
 *.sqlite
-*.sqlite3
 
 # Temporary files
 *.tmp
 *.temp
-temp/
-tmp/
 
-# Package files
-*.tgz
+# Large files
+*.zip
 *.tar.gz
-
-# Coverage reports
-coverage/
-*.lcov
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Optional npm cache directory
-.npm
-
-# Optional eslint cache
-.eslintcache
-
-# Microbundle cache
-.rpt2_cache/
-.rts2_cache_cjs/
-.rts2_cache_es/
-.rts2_cache_umd/
-
-# Optional REPL history
-.node_repl_history
-
-# Output of 'npm pack'
-*.tgz
-
-# Yarn Integrity file
-.yarn-integrity
-
-# parcel-bundler cache (https://parceljs.org/)
-.cache
-.parcel-cache
-
-# Next.js build output
-.next
-
-# Nuxt.js build / generate output
-.nuxt
-
-# Gatsby files
-.cache/
-public
-
-# Storybook build outputs
-.out
-.storybook-out
-
-# Temporary folders
-tmp/
-temp/
-
-# FAISS index files (can be large)
-*.index
-faiss_*.index/
-**/faiss_*.index/
-faiss_cdt.index/
-
-# Large data files
-*.csv
-*.xlsx
-*.xls
-*.json
-!package.json
-!package-lock.json
-!yarn.lock
-!jsconfig.json
-!tsconfig.json
-
-# Annotated files (can be large)
-AnnotatedFiles/
-**/AnnotatedFiles/
-
-# Images (optional - uncomment if you don't want to track images)
-# *.jpg
-# *.jpeg
-# *.png
-# *.gif
-# *.svg
-# *.ico
-
-# Audio files
-*.mp3
-*.wav
-*.m4a
-*.aac
-
-# Video files
-*.mp4
-*.avi
-*.mov
-*.wmv
